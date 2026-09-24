@@ -35,4 +35,5 @@ Thumbs.db
 
 # Local agent & memory artifacts
 .remember/
+.superpowers/
 .claude/settings.local.json
