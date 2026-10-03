@@ -306,6 +306,91 @@ describe('useTerminalStore', () => {
     expect(desktopSetBitrate).toHaveBeenCalledWith(3_000_000);
   });
 
+  it('rolls the picker back to the streaming source when a select is refused', async () => {
+    const store = useTerminalStore();
+    desktopStart.mockResolvedValueOnce({
+      track: { kind: 'video' },
+      streams: [],
+    });
+    const tabId = await store.openDesktopTab('ag-1', 'Host 1');
+
+    desktopSourcesHandler?.([
+      { id: 'monitor:1', default: true },
+      { id: 'window:9', default: false },
+    ]);
+    await nextTick();
+    expect(store.tabs.find((t) => t.id === tabId)?.desktopSourceId).toBe(
+      'monitor:1',
+    );
+
+    // The user picks another source: the tab records it optimistically.
+    store.selectDesktopSource(tabId, 'window:9');
+    await nextTick();
+    expect(store.tabs.find((t) => t.id === tabId)?.desktopSourceId).toBe(
+      'window:9',
+    );
+
+    // The agent refuses and keeps streaming the old source (spec §2.2). The
+    // picker must snap back or it keeps showing a source that is not on screen.
+    desktopStatsHandler?.({
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      targetBitrateBps: 6_000_000,
+      status: { kind: 'select-refused', detail: 'unknown source id' },
+    });
+    await nextTick();
+
+    expect(store.tabs.find((t) => t.id === tabId)?.desktopSourceId).toBe(
+      'monitor:1',
+    );
+  });
+
+  it('rolls back to the last confirmed source, not the original default', async () => {
+    const store = useTerminalStore();
+    desktopStart.mockResolvedValueOnce({
+      track: { kind: 'video' },
+      streams: [],
+    });
+    const tabId = await store.openDesktopTab('ag-1', 'Host 1');
+
+    desktopSourcesHandler?.([
+      { id: 'monitor:1', default: true },
+      { id: 'monitor:2', default: false },
+      { id: 'window:9', default: false },
+    ]);
+    await nextTick();
+
+    // A first switch succeeds: the plain stats frame confirms it, so the
+    // confirmed source advances from the original default to monitor:2.
+    store.selectDesktopSource(tabId, 'monitor:2');
+    await nextTick();
+    desktopStatsHandler?.({
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      targetBitrateBps: 6_000_000,
+    });
+    await nextTick();
+
+    // A later switch is refused: the picker must roll back to monitor:2 — the
+    // source actually on screen — not to the original monitor:1 default.
+    store.selectDesktopSource(tabId, 'window:9');
+    await nextTick();
+    desktopStatsHandler?.({
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      targetBitrateBps: 6_000_000,
+      status: { kind: 'select-refused', detail: 'unknown source id' },
+    });
+    await nextTick();
+
+    expect(store.tabs.find((t) => t.id === tabId)?.desktopSourceId).toBe(
+      'monitor:2',
+    );
+  });
+
   it('tears down the control subscriptions on closeTab', async () => {
     const store = useTerminalStore();
     desktopStart.mockResolvedValueOnce({
