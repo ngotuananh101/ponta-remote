@@ -1184,6 +1184,26 @@ mod tests {
         }
     }
 
+    /// Like `solid`, but the green channel sweeps with `seed`, so two frames at
+    /// the same size carry a *substantially* different pattern — large enough to
+    /// trip openh264's scene-change detector (a small delta does not; measured
+    /// threshold is around a 16-level shift, and a swept pattern is well past
+    /// it).
+    fn patterned(width: u32, height: u32, seed: usize) -> RawFrame {
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            px[0] = ((i + seed * 37) % 251) as u8;
+            px[1] = (((i / 251) + seed * 53) % 251) as u8;
+            px[2] = ((i * (seed + 1)) % 251) as u8;
+            px[3] = 255;
+        }
+        RawFrame {
+            width,
+            height,
+            rgba,
+        }
+    }
+
     #[test]
     fn downscale_fits_1080p_into_the_720p_box() {
         let frame = downscale(
@@ -1700,53 +1720,62 @@ mod tests {
         );
     }
 
-    /// Watch item from the ADR-23 spike (spec §3.7): the spike used
-    /// `CameraVideoRealTime` because `ScreenContentRealTime` forces scene-change
-    /// detection on, which the spike author expected to emit an IDR every frame.
-    /// The production encoder uses `ScreenContentRealTime`, so this pins what it
-    /// actually does — the ADR-24 fallback's one-IDR assumption depends on it.
+    /// Pins what `ScreenContentRealTime` actually does, replacing the plan's
+    /// original assertion that it emits an IDR only on the first frame.
     ///
-    /// **The watch item FIRED (measured 2026-10-03).** The assertion below is
-    /// the plan's original and is deliberately left unchanged; the test is
-    /// `#[ignore]`d only so Task 3's commit stays green pending the PM's
-    /// decision on ADR-24. Measurements against `DesktopEncoder::new`
-    /// (`ScreenContentRealTime`): varying height (this test's frames, cropped)
-    /// gives 2 IDRs after frame 0 — one per resolution change, not a clean
-    /// scene-change signal; constant 320×240 with varying content gives 5 IDRs
-    /// (one per frame); constant 320×240 with constant content gives 0 IDRs.
-    /// So `ScreenContentRealTime` emits an IDR on every content change — near
-    /// per-frame for real desktop content — which invalidates ADR-24's
-    /// "one IDR on a resolution change" bitrate analysis. Raised to the PM
-    /// before Task 4b, as this test's own note requires.
+    /// **The watch item FIRED (measured 2026-10-03).** The plan's original
+    /// assertion (`0` IDRs after frame 0 under *varying* content) is **disproven**
+    /// and is not what this test asserts any more. Measurements against
+    /// `DesktopEncoder::new` (`ScreenContentRealTime`): varying content at a
+    /// fixed size emits an IDR on every content change (5 IDRs / 5 changed
+    /// frames); constant content emits none (0 IDRs); varying *geometry* gives
+    /// 2 IDRs across 3 frames. So the usage type emits an IDR on every content
+    /// change — near per-frame for real desktop content — which is why ADR-24's
+    /// "one IDR on a resolution change" is not a distinct artifact class. Raised
+    /// to the PM; **watch item resolved by the PM ruling of 2026-10-03**: keep
+    /// `ScreenContentRealTime` unchanged, keep the Task 4d fallback unchanged,
+    /// and pin the measured behavior here instead of the disproven assertion.
     #[test]
-    #[ignore = "watch item fired: see the note above; pending PM ruling on ADR-24"]
-    fn screen_content_usage_emits_an_idr_only_on_the_first_frame() {
-        let mut encoder = DesktopEncoder::new(StreamProfile::SAFE_720P30).expect("encoder");
-        // A moving frame each round, so a scene-change detector has something to
-        // fire on. Count IDRs (NAL type 5) across rounds 1..=5.
-        let mut idrs_after_first = 0;
-        for round in 0..6 {
-            let frame = solid(320, 240 + round); // odd height: encode() asserts even, so crop
-            let frame = crop_to_even(frame);
-            let data = encoder.encode(&frame).expect("encode");
-            if round == 0 {
-                continue; // the first access unit is allowed to be an IDR
-            }
-            let mut i = 0;
-            while i + 5 <= data.len() {
-                if data[i..i + 4] == [0, 0, 0, 1] && (data[i + 4] & 0x1F) == 5 {
-                    idrs_after_first += 1;
-                }
-                i += 1;
-            }
+    fn screen_content_real_time_emits_idrs_on_content_change() {
+        // (a) Identical consecutive frames: no IDR after the first access unit.
+        let mut steady = DesktopEncoder::new(StreamProfile::SAFE_720P30).expect("encoder");
+        let frame = patterned(320, 240, 0);
+        let _ = steady.encode(&frame).expect("first");
+        let mut idrs = 0;
+        for _ in 0..5 {
+            let data = steady.encode(&frame).expect("encode");
+            idrs += count_idrs(&data);
         }
-        // If this fails, `ScreenContentRealTime` DOES emit an IDR per frame:
-        // record it in the PR body and raise it to the PM before Task 4b, because
-        // it invalidates ADR-24's "one IDR on a resolution change" analysis.
         assert_eq!(
-            idrs_after_first, 0,
-            "ScreenContentRealTime emitted {idrs_after_first} IDR(s) after frame 0"
+            idrs, 0,
+            "constant content must not emit an IDR after the first access unit"
         );
+
+        // (b) Different content at a fixed size: at least one IDR after frame 0.
+        let mut changing = DesktopEncoder::new(StreamProfile::SAFE_720P30).expect("encoder");
+        let _ = changing.encode(&patterned(320, 240, 0)).expect("first");
+        let mut idrs = 0;
+        for seed in 1..=5usize {
+            let data = changing.encode(&patterned(320, 240, seed)).expect("encode");
+            idrs += count_idrs(&data);
+        }
+        assert!(
+            idrs >= 1,
+            "ScreenContentRealTime must emit an IDR on a content change, got {idrs}"
+        );
+    }
+
+    /// Count IDR NAL units (type 5) in an Annex-B byte stream.
+    fn count_idrs(data: &[u8]) -> usize {
+        let mut count = 0;
+        let mut i = 0;
+        while i + 5 <= data.len() {
+            if data[i..i + 4] == [0, 0, 0, 1] && (data[i + 4] & 0x1F) == 5 {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
     }
 
     #[test]
