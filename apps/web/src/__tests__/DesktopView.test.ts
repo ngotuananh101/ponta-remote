@@ -119,6 +119,31 @@ describe('DesktopView', () => {
     expect(picker.findAll('option')).toHaveLength(2);
   });
 
+  it('associates the source picker with a label (accessible name)', () => {
+    const wrapper = mount(DesktopView, {
+      props: {
+        tab: desktopTab({
+          desktopSources: twoSources,
+          desktopSourceId: 'monitor:1',
+        }),
+      },
+    });
+    const picker = wrapper.find('[data-test="desktop-source-picker"]');
+    // A bare <select> has no accessible name — the control is announced as an
+    // unnamed combobox. SonarCloud's `InputWithoutLabelCheck` fails the gate on
+    // it, and it is a real a11y regression for a screen-reader user. Assert the
+    // *association* (`select.labels`), not mere ancestor containment: a future
+    // wrapper <label> around the whole chrome would satisfy `closest('label')`
+    // while leaving the select unnamed.
+    const select = picker.element as HTMLSelectElement;
+    expect(select.labels).toHaveLength(1);
+    expect(select.labels[0]!.control).toBe(select);
+    expect(select.labels[0]!.textContent).toContain('Source');
+    // The label must name the picker alone — not wrap the neighbouring bitrate
+    // control, which would give both controls the same (wrong) accessible name.
+    expect(select.labels[0]!.textContent).not.toContain('Bitrate');
+  });
+
   it('calls selectDesktopSource when the picker changes', async () => {
     const store = useTerminalStore();
     const select = vi

@@ -376,6 +376,57 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
     }
   }, 120_000);
 
+  // A source swap must report the *real* frame size, never the profile box.
+  // `downscale` never upscales, so the test source (1280×720) stays 1280×720
+  // under the 1080p30 default box (1920×1080) — the UI must be told the former.
+  // Re-selecting the only test source is a real (non-refused) swap (ADR-22).
+  it('reports the real frame size after a source swap, not the profile box', async () => {
+    const { token, agentId, credential, sessionId } = await seed({
+      capabilities: ['desktop'],
+    });
+
+    spawnAgent(agentId, credential, ['--desktop-source', 'test']);
+    await waitForAgentOnline(token, agentId);
+
+    const { offerer, controlFrames } = await openDesktopPeer(sessionId, token);
+    const stats = (): DesktopStats[] =>
+      controlFrames
+        .filter((f) => f.type === 'desktop-stats')
+        .map((f) => f.payload as DesktopStats);
+
+    try {
+      await waitFor(
+        () => stats().length > 0,
+        'an initial desktop-stats',
+        20_000,
+      );
+      const before = stats().length;
+
+      offerer.dataChannels.sendJson('control', 'desktop-select', {
+        sourceId: 'test:0',
+      });
+
+      // The first stats after the swap must carry the real frame size. With the
+      // profile-box bug it carries 1920×1080 and never self-corrects, so this
+      // wait times out — the regression the fix pins.
+      await waitFor(
+        () =>
+          stats()
+            .slice(before)
+            .some((s) => s.width === 1280 && s.height === 720),
+        'a post-swap desktop-stats with the real frame size',
+        20_000,
+      );
+      expect(
+        stats()
+          .slice(before)
+          .every((s) => s.width === 1280 && s.height === 720),
+      ).toBe(true);
+    } finally {
+      await offerer.close();
+    }
+  }, 120_000);
+
   // Review Focus #4: desktop mode must not have altered the terminal answer
   // path. The agent is spawned with the desktop flag present but is offered a
   // terminal session, and the terminal frame contract must be unchanged.

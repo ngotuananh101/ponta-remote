@@ -954,6 +954,12 @@ pub async fn run_stream(
     // The last encoded frame's dimensions — what `desktop-stats` reports, so
     // the UI's "1920×1080" reflects what is actually on the wire.
     let mut encoded_size = (profile.max_width, profile.max_height);
+    // A retarget/swap/downgrade cannot know the *next* frame's real size (the
+    // source may be smaller than the profile box, and `downscale` never
+    // upscales), so it defers its stats frame to the next encode — where the
+    // true size is known. `None` = nothing pending; `Some(status)` = emit on
+    // the next frame with that status (`None` status = a plain retarget ack).
+    let mut pending_stats: Option<Option<StatsStatus>> = None;
     // Set once the control sender is gone, so the `select!` arm is disabled and
     // the loop cannot spin on a closed channel (a `continue` on `None` would).
     let mut control_closed = false;
@@ -1007,10 +1013,11 @@ pub async fn run_stream(
                         {
                             Ok(new_encoder) => {
                                 encoder = new_encoder;
-                                // The new source may be a different size; the UI
-                                // learns it from the next stats frame.
-                                encoded_size = (profile.max_width, profile.max_height);
-                                send_stats(&events, encoded_size, profile, None);
+                                // The new source may be a different size, and
+                                // `downscale` never upscales — defer the stats
+                                // frame to the next encode, where the real size
+                                // is known (spec §6.4).
+                                pending_stats = Some(None);
                             }
                             Err(e) => {
                                 // The stream keeps running on the current source
@@ -1044,6 +1051,19 @@ pub async fn run_stream(
                 let data = encoder.encode(&frame)?;
                 let encode_time = encode_start.elapsed();
 
+                encoded += 1;
+                encoded_size = (frame.width, frame.height);
+                // The UI gets one stats frame as soon as the stream is live
+                // (spec §2.3 step 6), then one per retarget/swap/downgrade —
+                // emitted here, where `encoded_size` is the real frame size. A
+                // swap's pending frame is consumed on this tick; a downgrade
+                // *below* defers its own to the next tick, because this tick's
+                // frame was encoded at the pre-downgrade size.
+                if encoded == 1 || pending_stats.is_some() {
+                    let status = pending_stats.take().flatten();
+                    send_stats(&events, encoded_size, profile, status);
+                }
+
                 if sustain.observe(encode_time) == SustainAction::Downgrade {
                     // ADR-24: the host cannot sustain the current profile's
                     // budget, so drop to the guaranteed floor. One rebuild, one
@@ -1057,25 +1077,12 @@ pub async fn run_stream(
                     profile = StreamProfile::SAFE_720P30;
                     encoder = DesktopEncoder::new(profile)?;
                     sustain = SustainMonitor::new(profile);
-                    encoded_size = (profile.max_width, profile.max_height);
-                    // The stats' width/height already reflect the new size (§6.4).
-                    send_stats(
-                        &events,
-                        encoded_size,
-                        profile,
-                        Some(StatsStatus {
-                            kind: StatsStatusKind::QualityDowngraded,
-                            detail: "720p30 (quality downgraded)".to_string(),
-                        }),
-                    );
-                }
-
-                encoded += 1;
-                encoded_size = (frame.width, frame.height);
-                // The UI gets one stats frame as soon as the stream is live
-                // (spec §2.3 step 6), then on every retarget.
-                if encoded == 1 {
-                    send_stats(&events, encoded_size, profile, None);
+                    // The stats frame carries the *real* next-frame size, so it
+                    // is deferred one tick (§6.4) rather than reporting the box.
+                    pending_stats = Some(Some(StatsStatus {
+                        kind: StatsStatusKind::QualityDowngraded,
+                        detail: "720p30 (quality downgraded)".to_string(),
+                    }));
                 }
                 // Diagnostic for the black-video hunt: distinguishes a blank
                 // *capture* (nonblack ~0) from a *skipped* encode (nonblack high

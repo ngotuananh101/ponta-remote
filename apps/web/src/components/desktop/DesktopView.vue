@@ -84,21 +84,26 @@ function onBitrateChange(event: Event): void {
       "
       class="absolute top-0 left-0 right-0 flex flex-wrap items-center gap-3 bg-[#090d16]/80 px-3 py-1.5 text-xs"
     >
-      <select
+      <label
         v-if="tab.desktopSources?.length"
-        data-test="desktop-source-picker"
-        class="rounded border border-border/60 bg-transparent px-1 py-0.5"
-        :value="tab.desktopSourceId"
-        @change="onSourceChange"
+        class="flex items-center gap-1 text-muted-foreground"
       >
-        <option
-          v-for="source in tab.desktopSources"
-          :key="source.id"
-          :value="source.id"
+        <span>Source</span>
+        <select
+          data-test="desktop-source-picker"
+          class="rounded border border-border/60 bg-transparent px-1 py-0.5"
+          :value="tab.desktopSourceId"
+          @change="onSourceChange"
         >
-          {{ source.name }}{{ source.default ? ' (streaming)' : '' }}
-        </option>
-      </select>
+          <option
+            v-for="source in tab.desktopSources"
+            :key="source.id"
+            :value="source.id"
+          >
+            {{ source.name }}{{ source.default ? ' (streaming)' : '' }}
+          </option>
+        </select>
+      </label>
 
       <label class="flex items-center gap-1 text-muted-foreground">
         <span>Bitrate</span>
