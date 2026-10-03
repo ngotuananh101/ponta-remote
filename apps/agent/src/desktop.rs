@@ -345,12 +345,20 @@ fn run_capture<R: CaptureRecorder>(
 }
 
 impl ScreenSource {
-    /// Starts capture of a specific monitor (ADR-22 source selection).
+    /// Starts capture of a specific monitor by id (ADR-22 source selection).
     ///
-    /// The recorder is created inside the same capture thread as Week 7 — the
-    /// monitor is moved in, so no non-`Send` capture object crosses the thread
-    /// boundary (spec §6.2, and the Week 7 `is_send` probes).
-    pub async fn for_monitor(monitor: xcap::Monitor) -> Result<Self> {
+    /// The monitor is looked up and the recorder created inside the same
+    /// capture thread as Week 7, so no non-`Send` capture object crosses the
+    /// thread boundary (spec §6.2). The lookup must happen *inside* the thread,
+    /// not before it: `xcap`'s Windows `ImplMonitor` carries no
+    /// `unsafe impl Send`, so an `xcap::Monitor` captured by the `move` closure
+    /// is a compile error on `x86_64-pc-windows-msvc` (E0277). Only the `u32`
+    /// id is moved in; the monitor is built and used where it is used.
+    ///
+    /// An id absent from the live enumeration is reported as `unknown source
+    /// id`, the same refusal `source_for` gives for a bad scheme — a hostile
+    /// `desktop-select` can never name a source the agent did not offer (§9).
+    pub async fn for_monitor(monitor_id: u32) -> Result<Self> {
         let (ready_tx, ready_rx) = oneshot::channel::<std::result::Result<(), String>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<xcap::Frame>();
@@ -358,6 +366,13 @@ impl ScreenSource {
         let thread = std::thread::Builder::new()
             .name("desktop-capture".into())
             .spawn(move || {
+                let monitor = match find_monitor(monitor_id) {
+                    Ok(monitor) => monitor,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("{e:#}")));
+                        return;
+                    }
+                };
                 let recorder = match monitor.video_recorder() {
                     Ok(recorder) => recorder,
                     Err(e) => {
@@ -520,12 +535,12 @@ pub async fn source_for(id: &str, _profile: StreamProfile) -> Result<Box<dyn Fra
             let wanted: u32 = raw
                 .parse()
                 .map_err(|_| anyhow::anyhow!("unknown source id {id:?}"))?;
-            let monitor = xcap::Monitor::all()
-                .context("listing monitors")?
-                .into_iter()
-                .find(|m| m.id().map(|mid| mid == wanted).unwrap_or(false))
-                .ok_or_else(|| anyhow::anyhow!("unknown source id {id:?}"))?;
-            Ok(Box::new(ScreenSource::for_monitor(monitor).await?))
+            // Validation (the lookup against the enumeration) happens inside
+            // the capture thread, so no `xcap::Monitor` is ever captured by a
+            // `move` closure — see `ScreenSource::for_monitor` and
+            // `find_monitor`. An id absent from the enumeration still fails
+            // with `unknown source`, just reported from the thread.
+            Ok(Box::new(ScreenSource::for_monitor(wanted).await?))
         }
         "window" => {
             let wanted: u32 = raw
@@ -545,6 +560,25 @@ pub async fn source_for(id: &str, _profile: StreamProfile) -> Result<Box<dyn Fra
         "test" => Ok(Box::new(TestPatternSource::new(1280, 720))),
         _ => bail!("unknown source id {id:?}"),
     }
+}
+
+/// The live monitor whose id matches `wanted`, or an `unknown source id`
+/// error. Enumerates and drops the non-matching monitors here, so only the
+/// matched one — the sole non-`Send` capture object — is returned to the
+/// caller.
+///
+/// Called by the capture thread (see `ScreenSource::for_monitor`): `xcap`'s
+/// Windows `ImplMonitor` holds a raw `HMONITOR` and carries no
+/// `unsafe impl Send`, so an `xcap::Monitor` must never be captured by a
+/// `move` closure — it is created inside the thread that uses it instead
+/// (spec §6.2). Distinct from `primary_monitor`, which resolves the *default*
+/// source by preference order rather than by id.
+fn find_monitor(wanted: u32) -> Result<xcap::Monitor> {
+    xcap::Monitor::all()
+        .context("listing monitors")?
+        .into_iter()
+        .find(|m| m.id().map(|mid| mid == wanted).unwrap_or(false))
+        .ok_or_else(|| anyhow::anyhow!("unknown source id \"monitor:{wanted}\""))
 }
 
 /// The monitor at the origin, else the explicitly primary one, else any
