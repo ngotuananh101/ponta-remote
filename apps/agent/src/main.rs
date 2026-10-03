@@ -74,6 +74,17 @@ struct Cli {
     /// deterministic pattern (what CI and the E2E harness use).
     #[arg(long, env = "AGENT_DESKTOP_SOURCE", value_enum, default_value_t = DesktopSource::Screen)]
     desktop_source: DesktopSource,
+
+    /// Desktop quality profile. `1080p30` is the default; `720p30` is the safe
+    /// floor for a host that cannot sustain 1080p30 (ADR-24).
+    #[arg(long, env = "AGENT_DESKTOP_PROFILE", default_value = "1080p30")]
+    desktop_profile: String,
+
+    /// Which source streams before any selection (spec §6.1). `primary` (the
+    /// default) means the primary monitor; any other value is an explicit
+    /// source id validated against the enumeration at startup.
+    #[arg(long, env = "AGENT_DESKTOP_DEFAULT_SOURCE", default_value = "primary")]
+    desktop_default_source: String,
 }
 
 /// `--credential-or-env` in the roadmap is realised as clap's
@@ -267,6 +278,62 @@ enum DesktopSource {
     Test,
 }
 
+/// The resolved quality for one desktop session (ADR-21).
+///
+/// Resolved once at session start from the CLI/env, then read by the downscale
+/// box, the ticker cadence, and the encoder config. `bitrate_bps` is the only
+/// member adjustable after start (ADR-23).
+///
+/// Defined here, beside `DesktopSource`, rather than in `desktop.rs`: it is pure
+/// data, and `SessionConfig` (which is unconditional) holds one. A type named
+/// only inside the `#[cfg(not(target_env = "musl"))]` `desktop` module would be
+/// E0433 on musl.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamProfile {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub fps: f32,
+    pub bitrate_bps: u32,
+}
+
+impl StreamProfile {
+    /// Default: 1080p30 at 6 Mbps (ADR-24's conditional target).
+    pub const DEFAULT_1080P30: Self = Self {
+        max_width: 1920,
+        max_height: 1080,
+        fps: 30.0,
+        bitrate_bps: 6_000_000,
+    };
+    /// The guaranteed floor: 720p30 at 4 Mbps (ADR-24).
+    pub const SAFE_720P30: Self = Self {
+        max_width: 1280,
+        max_height: 720,
+        fps: 30.0,
+        bitrate_bps: 4_000_000,
+    };
+
+    /// The frame budget in seconds — `1 / fps`.
+    pub fn frame_budget(&self) -> Duration {
+        Duration::from_secs_f32(1.0 / self.fps)
+    }
+}
+
+/// Parse `--desktop-profile` / `AGENT_DESKTOP_PROFILE`.
+///
+/// Only the two named profiles exist; anything else is an error rather than a
+/// silent default, so a typo in a deployment fails loudly at startup.
+impl std::str::FromStr for StreamProfile {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "1080p30" => Ok(Self::DEFAULT_1080P30),
+            "720p30" => Ok(Self::SAFE_720P30),
+            other => bail!("unknown desktop profile {other:?}; expected 1080p30 or 720p30"),
+        }
+    }
+}
+
 /// What an offer asks this agent to serve (ADR-15). Decided from the offer's
 /// capabilities *before* the answer is built.
 #[derive(Debug, PartialEq, Eq)]
@@ -307,6 +374,13 @@ struct SessionConfig {
     /// CLI shape is identical on every target.
     #[allow(dead_code)]
     desktop_source: DesktopSource,
+    /// Unused on musl, where the desktop module is compiled out; kept so the
+    /// CLI shape is identical on every target.
+    #[allow(dead_code)]
+    desktop_profile: StreamProfile,
+    /// Unused on musl for the same reason as `desktop_profile`.
+    #[allow(dead_code)]
+    desktop_default_source: String,
 }
 
 /// Connect, serve, and reconnect with exponential backoff until told to stop.
@@ -346,12 +420,19 @@ async fn run_with_reconnect(cli: &Cli, credential: &str, shell: &str) -> Result<
     let mut outbound_tx = Some(outbound_tx);
     let mut ice_rx = Some(ice_rx);
 
+    let desktop_profile: StreamProfile = cli
+        .desktop_profile
+        .parse()
+        .context("--desktop-profile / AGENT_DESKTOP_PROFILE")?;
+
     let cfg = SessionConfig {
         stun: cli.stun.clone(),
         cols: cli.cols,
         rows: cli.rows,
         shell: shell.to_string(),
         desktop_source: cli.desktop_source,
+        desktop_profile,
+        desktop_default_source: cli.desktop_default_source.clone(),
     };
 
     let mut delay = signal::BACKOFF_INITIAL;
@@ -993,10 +1074,25 @@ async fn run_desktop_session(
     // Create the source first so a capture failure is a clean refusal
     // (`approved: false`) instead of a session the browser opens onto a black
     // video element.
-    let source: Box<dyn desktop::FrameSource> = match cfg.desktop_source {
-        DesktopSource::Test => Box::new(desktop::TestPatternSource::new(1280, 720)),
-        DesktopSource::Screen => match desktop::ScreenSource::new().await {
-            Ok(source) => Box::new(source),
+    //
+    // A bad default-source preference (or an unreadable primary monitor) is a
+    // refusal too, not a propagated error: the client must see `approved: false`,
+    // the same as a capture failure, not a dropped signaling connection.
+    let default_id = match desktop::default_source_id(
+        cfg.desktop_source == DesktopSource::Test,
+        &cfg.desktop_default_source,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = ?e, "desktop default source unavailable; refusing the offer");
+            rtc::refuse_offer(peer, offer, outbound).await?;
+            let _ = peer.close().await;
+            return Ok(());
+        }
+    };
+    let source: Box<dyn desktop::FrameSource> =
+        match desktop::source_for(&default_id, cfg.desktop_profile).await {
+            Ok(source) => source,
             Err(e) => {
                 // `?e` (Debug) prints anyhow's full chain; `%e` (Display) would
                 // show only the outermost context ("opening the video recorder")
@@ -1006,8 +1102,7 @@ async fn run_desktop_session(
                 let _ = peer.close().await;
                 return Ok(());
             }
-        },
-    };
+        };
 
     let media = rtc::attach_desktop_track(peer).await?;
     rtc::send_desktop_answer(peer, offer, outbound).await?;
@@ -1086,6 +1181,7 @@ async fn run_desktop_session(
         media.track.clone(),
         ssrc,
         payload_type,
+        cfg.desktop_profile,
         stop_rx,
     ));
 
@@ -1764,5 +1860,29 @@ mod tests {
             matches!(received, Some(signal::SignalMessage::IceCandidate(_))),
             "a late candidate must reach the live session after re-attach"
         );
+    }
+
+    #[test]
+    fn stream_profile_parses_the_two_named_profiles() {
+        assert_eq!(
+            "1080p30".parse::<StreamProfile>().unwrap(),
+            StreamProfile::DEFAULT_1080P30
+        );
+        assert_eq!(
+            "720p30".parse::<StreamProfile>().unwrap(),
+            StreamProfile::SAFE_720P30
+        );
+    }
+
+    #[test]
+    fn stream_profile_rejects_an_unknown_name() {
+        let err = "1080p60".parse::<StreamProfile>().unwrap_err();
+        assert!(format!("{err:#}").contains("expected 1080p30 or 720p30"));
+    }
+
+    #[test]
+    fn stream_profile_frame_budget_matches_fps() {
+        let budget = StreamProfile::DEFAULT_1080P30.frame_budget();
+        assert!((budget.as_secs_f32() - 1.0 / 30.0).abs() < 1e-6);
     }
 }

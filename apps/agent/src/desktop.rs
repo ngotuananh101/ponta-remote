@@ -23,9 +23,9 @@ use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 // xcap-only imports below need no cfg of their own.
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
-/// The biggest frame that is ever encoded: ~720p, the Week 7 budget.
-pub const MAX_WIDTH: u32 = 1280;
-pub const MAX_HEIGHT: u32 = 720;
+// `StreamProfile` is pure data and lives in `main.rs` (unconditional) so that
+// `SessionConfig` — which is also unconditional — can name it on musl.
+use crate::StreamProfile;
 
 /// One frame, RGBA8, `width * height * 4` bytes.
 #[derive(Clone)]
@@ -339,9 +339,12 @@ fn run_capture<R: CaptureRecorder>(
 }
 
 impl ScreenSource {
-    /// Starts capture of the primary monitor (falling back to the first
-    /// monitor when there is no primary, e.g. some Wayland sessions).
-    pub async fn new() -> Result<Self> {
+    /// Starts capture of a specific monitor (ADR-22 source selection).
+    ///
+    /// The recorder is created inside the same capture thread as Week 7 — the
+    /// monitor is moved in, so no non-`Send` capture object crosses the thread
+    /// boundary (spec §6.2, and the Week 7 `is_send` probes).
+    pub async fn for_monitor(monitor: xcap::Monitor) -> Result<Self> {
         let (ready_tx, ready_rx) = oneshot::channel::<std::result::Result<(), String>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let (frame_tx, frame_rx) = std::sync::mpsc::channel::<xcap::Frame>();
@@ -349,7 +352,7 @@ impl ScreenSource {
         let thread = std::thread::Builder::new()
             .name("desktop-capture".into())
             .spawn(move || {
-                let recorder = match primary_recorder() {
+                let recorder = match monitor.video_recorder() {
                     Ok(recorder) => recorder,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.to_string()));
@@ -396,30 +399,6 @@ impl ScreenSource {
     }
 }
 
-/// Picks a monitor and opens its recorder.
-///
-/// Preference order: the monitor at the origin (the primary in practice),
-/// then an explicitly primary monitor, then any monitor at all. A Wayland
-/// session with no primary flag set still gets a stream.
-fn primary_recorder() -> Result<(xcap::VideoRecorder, Receiver<xcap::Frame>)> {
-    let monitor = match xcap::Monitor::from_point(0, 0) {
-        Ok(monitor) => monitor,
-        Err(_) => {
-            let monitors = xcap::Monitor::all().context("listing monitors")?;
-            monitors
-                .iter()
-                .find(|m| m.is_primary().unwrap_or(false))
-                .or_else(|| monitors.first())
-                .ok_or_else(|| anyhow::anyhow!("no monitors found"))?
-                .clone()
-        }
-    };
-    let recorder = monitor
-        .video_recorder()
-        .context("opening the video recorder")?;
-    Ok(recorder)
-}
-
 impl FrameSource for ScreenSource {
     fn next_frame(&mut self) -> Result<Option<RawFrame>> {
         let Some(frames) = self.frames.as_ref() else {
@@ -438,6 +417,281 @@ impl FrameSource for ScreenSource {
         }
         // Bounded join: the capture thread checks the stop flag every 100 ms
         // and the recorder's `stop()` runs its own shutdown path.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A capture source's kind. Serialises as the wire string (§5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    Monitor,
+    Window,
+}
+
+/// One capture source the agent can stream (spec §5.1).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DesktopSourceInfo {
+    pub id: String,
+    pub kind: SourceKind,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    #[serde(rename = "scaleFactor")]
+    pub scale_factor: f32,
+    pub rotation: f32,
+    #[serde(rename = "isPrimary")]
+    pub is_primary: bool,
+    pub default: bool,
+}
+
+/// Enumerate every monitor and window the agent could stream (spec §6.2).
+///
+/// A source whose accessor fails is skipped rather than failing the whole
+/// enumeration: one window that vanished between listing and reading its
+/// geometry must not cost the picker every other entry.
+pub fn enumerate_sources() -> Result<Vec<DesktopSourceInfo>> {
+    let mut sources = Vec::new();
+    for monitor in xcap::Monitor::all().context("listing monitors")? {
+        let Ok(id) = monitor.id() else { continue };
+        sources.push(DesktopSourceInfo {
+            id: format!("monitor:{id}"),
+            kind: SourceKind::Monitor,
+            name: monitor
+                .friendly_name()
+                .or_else(|_| monitor.name())
+                .unwrap_or_else(|_| format!("Monitor {id}")),
+            width: monitor.width().unwrap_or(0),
+            height: monitor.height().unwrap_or(0),
+            x: monitor.x().unwrap_or(0),
+            y: monitor.y().unwrap_or(0),
+            scale_factor: monitor.scale_factor().unwrap_or(1.0),
+            rotation: monitor.rotation().unwrap_or(0.0),
+            is_primary: monitor.is_primary().unwrap_or(false),
+            default: false,
+        });
+    }
+    for window in xcap::Window::all().context("listing windows")? {
+        let Ok(id) = window.id() else { continue };
+        if window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+        sources.push(DesktopSourceInfo {
+            id: format!("window:{id}"),
+            kind: SourceKind::Window,
+            name: window.title().unwrap_or_else(|_| format!("Window {id}")),
+            width: window.width().unwrap_or(0),
+            height: window.height().unwrap_or(0),
+            x: window.x().unwrap_or(0),
+            y: window.y().unwrap_or(0),
+            scale_factor: 1.0,
+            rotation: 0.0,
+            is_primary: false,
+            default: false,
+        });
+    }
+    Ok(sources)
+}
+
+/// Build the `FrameSource` for an enumerated id (spec §6.2).
+///
+/// Async because the monitor arm awaits `ScreenSource::for_monitor`'s
+/// first-frame handshake — a monitor source that is not actually delivering is
+/// an error the caller can refuse on, not a black stream (the Week 7 invariant).
+/// The id is validated by *lookup against the enumeration*, never parsed into a
+/// platform handle directly: an unknown id is an error, so a hostile
+/// `desktop-select` can never name a source the agent did not offer (§9).
+pub async fn source_for(id: &str, _profile: StreamProfile) -> Result<Box<dyn FrameSource>> {
+    let (kind, raw) = id
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("unknown source id {id:?}"))?;
+    match kind {
+        "monitor" => {
+            let wanted: u32 = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("unknown source id {id:?}"))?;
+            let monitor = xcap::Monitor::all()
+                .context("listing monitors")?
+                .into_iter()
+                .find(|m| m.id().map(|mid| mid == wanted).unwrap_or(false))
+                .ok_or_else(|| anyhow::anyhow!("unknown source id {id:?}"))?;
+            Ok(Box::new(ScreenSource::for_monitor(monitor).await?))
+        }
+        "window" => {
+            let wanted: u32 = raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("unknown source id {id:?}"))?;
+            let window = xcap::Window::all()
+                .context("listing windows")?
+                .into_iter()
+                .find(|w| w.id().map(|wid| wid == wanted).unwrap_or(false))
+                .ok_or_else(|| anyhow::anyhow!("unknown source id {id:?}"))?;
+            Ok(Box::new(WindowSource::new(window)?))
+        }
+        // The synthetic pattern (spec §2.3): the only source that exists under
+        // `--desktop-source test`, and the id `default_source_id` returns there.
+        // It is built here, not in a caller-side match, so the pre-answer
+        // source, a swap, and the E2E path all go through one factory.
+        "test" => Ok(Box::new(TestPatternSource::new(1280, 720))),
+        _ => bail!("unknown source id {id:?}"),
+    }
+}
+
+/// The monitor at the origin, else the explicitly primary one, else any
+/// (Week 7's `primary_recorder` preference order, split out so both the default
+/// source and `source_for` pick the same monitor).
+fn primary_monitor() -> Result<xcap::Monitor> {
+    if let Ok(monitor) = xcap::Monitor::from_point(0, 0) {
+        return Ok(monitor);
+    }
+    let monitors = xcap::Monitor::all().context("listing monitors")?;
+    monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no monitors found"))
+}
+
+/// The id of the source streamed before any selection (ADR-22).
+///
+/// Under `--desktop-source test` the default is the synthetic pattern; on a
+/// real host it is the source `preference` names (spec §6.1's
+/// `DESKTOP_DEFAULT_SOURCE`), so the enumeration's `default: true` entry and the
+/// live stream always agree.
+///
+/// `preference` is `"primary"` (the shipped default) or an explicit source id.
+/// An explicit id is validated against the live enumeration, so a typo is a
+/// startup error rather than a black stream; `"primary"` resolves through the
+/// same `primary_recorder` logic Week 7 used (`primary_monitor`).
+pub fn default_source_id(test: bool, preference: &str) -> Result<String> {
+    if test {
+        return Ok("test:0".to_string());
+    }
+    if preference == "primary" {
+        let monitor = primary_monitor()?;
+        let id = monitor.id().context("reading the primary monitor id")?;
+        return Ok(format!("monitor:{id}"));
+    }
+    // An explicit id must name a source the agent can actually stream.
+    let known = enumerate_sources()?;
+    if known.iter().any(|source| source.id == preference) {
+        Ok(preference.to_string())
+    } else {
+        bail!(
+            "AGENT_DESKTOP_DEFAULT_SOURCE={preference:?} is not an enumerated source; \
+             use \"primary\" or one of: {}",
+            known
+                .iter()
+                .map(|source| source.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// A window's pixels, captured on demand (spec §6.2).
+///
+/// Window capture may include occluding windows depending on the platform
+/// backend; the picker labels window entries accordingly (spec §6.2). Unlike
+/// `ScreenSource` there is no recorder: the thread captures a fresh image per
+/// request, so the drop-oldest policy is "keep the latest request".
+pub struct WindowSource {
+    // The window lives on a dedicated thread (it is not `Send` on every
+    // platform — the same reason `ScreenSource` has one). A request channel
+    // asks for a frame; a reply channel carries it back.
+    request: Option<std::sync::mpsc::Sender<()>>,
+    frames: Option<Receiver<xcap::Frame>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WindowSource {
+    /// Starts a window-capture thread (spec §6.2).
+    ///
+    /// Sync, unlike `ScreenSource::for_monitor`: a window has no recorder to
+    /// open and no first-frame handshake, so "started" is just "the thread is
+    /// running". A window that fails to capture logs per tick and simply yields
+    /// no frame — the caller keeps streaming the previous one (ADR-22).
+    pub fn new(window: xcap::Window) -> Result<Self> {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<()>();
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<xcap::Frame>();
+
+        let thread = std::thread::Builder::new()
+            .name("window-capture".into())
+            .spawn(move || {
+                loop {
+                    if request_rx.recv().is_err() {
+                        break; // WindowSource dropped
+                    }
+                    match window.capture_image() {
+                        Ok(image) => {
+                            let frame =
+                                xcap::Frame::new(image.width(), image.height(), image.into_raw());
+                            if frame_tx.send(frame).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "window capture failed; skipping this tick")
+                        }
+                    }
+                }
+            })
+            .context("spawning the window capture thread")?;
+
+        Ok(Self {
+            request: Some(request_tx),
+            frames: Some(frame_rx),
+            thread: Some(thread),
+        })
+    }
+
+    /// Test seam: wires an already-built request sender, frame channel, and
+    /// responder thread, so `next_frame`/`stop` can be exercised without a
+    /// window. Mirrors `ScreenSource::from_parts_for_test` — the capture thread
+    /// is the only platform-specific part of the type.
+    #[cfg(test)]
+    fn from_parts_for_test(
+        request: std::sync::mpsc::Sender<()>,
+        frames: Receiver<xcap::Frame>,
+        thread: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            request: Some(request),
+            frames: Some(frames),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl FrameSource for WindowSource {
+    fn next_frame(&mut self) -> Result<Option<RawFrame>> {
+        let (Some(request), Some(frames)) = (self.request.as_ref(), self.frames.as_ref()) else {
+            return Ok(None);
+        };
+        // Ask for one capture, then take the newest frame it produced: a tick
+        // that ran late may have queued more than one, and the stream only ever
+        // wants the latest (drop-oldest, mirroring `drain_latest`).
+        if request.send(()).is_err() {
+            return Ok(None);
+        }
+        Ok(drain_latest(frames).map(|frame| RawFrame {
+            width: frame.width,
+            height: frame.height,
+            rgba: frame.raw,
+        }))
+    }
+
+    fn stop(&mut self) {
+        // Dropping the request sender makes `request_rx.recv()` return `Err`,
+        // which breaks the thread loop; the join is bounded by the in-flight
+        // capture finishing (exactly as `ScreenSource::stop`).
+        self.request.take();
+        self.frames.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -476,10 +730,6 @@ fn frame_content(frame: &RawFrame) -> (f64, [f64; 3]) {
     )
 }
 
-/// Tick interval: 15 fps. A tick with no new frame is skipped, so the real
-/// rate follows the display, never faster than this.
-pub const FRAME_INTERVAL: Duration = Duration::from_millis(66);
-
 /// Encodes frames as they arrive and writes each as one media sample.
 ///
 /// Runs until `stop` flips to `true` (checked before the first tick and after
@@ -495,6 +745,7 @@ pub async fn run_stream(
     track: Arc<TrackLocalStaticSample>,
     ssrc: SSRC,
     payload_type: PayloadType,
+    profile: StreamProfile,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     // `changed()` only resolves on the *next* send, so a signal that is
@@ -504,8 +755,8 @@ pub async fn run_stream(
         return Ok(());
     }
 
-    let mut encoder = DesktopEncoder::new()?;
-    let mut ticker = tokio::time::interval(FRAME_INTERVAL);
+    let mut encoder = DesktopEncoder::new(profile)?;
+    let mut ticker = tokio::time::interval(profile.frame_budget());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut skipped: u64 = 0;
@@ -525,7 +776,7 @@ pub async fn run_stream(
                     }
                     continue;
                 };
-                let frame = crop_to_even(downscale(&frame, MAX_WIDTH, MAX_HEIGHT));
+                let frame = crop_to_even(downscale(&frame, profile.max_width, profile.max_height));
                 let data = encoder.encode(&frame)?;
                 encoded += 1;
                 // Diagnostic for the black-video hunt: distinguishes a blank
@@ -548,7 +799,7 @@ pub async fn run_stream(
                 }
                 let sample = Sample {
                     data: Bytes::from(data),
-                    duration: FRAME_INTERVAL,
+                    duration: profile.frame_budget(),
                     ..Sample::new(Instant::now())
                 };
                 track
@@ -592,10 +843,10 @@ pub struct DesktopEncoder {
 }
 
 impl DesktopEncoder {
-    pub fn new() -> Result<Self> {
+    pub fn new(profile: StreamProfile) -> Result<Self> {
         let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(2_000_000))
-            .max_frame_rate(FrameRate::from_hz(15.0))
+            .bitrate(BitRate::from_bps(profile.bitrate_bps))
+            .max_frame_rate(FrameRate::from_hz(profile.fps))
             .usage_type(UsageType::ScreenContentRealTime)
             // `ScreenContentRealTime` does not implement adaptive quantization
             // or background detection. `EncoderConfig::new()` turns both on by
@@ -660,14 +911,22 @@ mod tests {
 
     #[test]
     fn downscale_fits_1080p_into_the_720p_box() {
-        let frame = downscale(&solid(1920, 1080), MAX_WIDTH, MAX_HEIGHT);
+        let frame = downscale(
+            &solid(1920, 1080),
+            StreamProfile::SAFE_720P30.max_width,
+            StreamProfile::SAFE_720P30.max_height,
+        );
         assert_eq!((frame.width, frame.height), (1280, 720));
         assert_eq!(frame.rgba.len(), (1280 * 720 * 4) as usize);
     }
 
     #[test]
     fn downscale_preserves_aspect_for_an_ultrawide() {
-        let frame = downscale(&solid(2560, 1080), MAX_WIDTH, MAX_HEIGHT);
+        let frame = downscale(
+            &solid(2560, 1080),
+            StreamProfile::SAFE_720P30.max_width,
+            StreamProfile::SAFE_720P30.max_height,
+        );
         assert_eq!((frame.width, frame.height), (1280, 540));
         assert_eq!(frame.width % 2, 0);
         assert_eq!(frame.height % 2, 0);
@@ -676,7 +935,11 @@ mod tests {
     #[test]
     fn downscale_never_upscales_a_small_screen() {
         let source = solid(800, 600);
-        let frame = downscale(&source, MAX_WIDTH, MAX_HEIGHT);
+        let frame = downscale(
+            &source,
+            StreamProfile::SAFE_720P30.max_width,
+            StreamProfile::SAFE_720P30.max_height,
+        );
         assert_eq!((frame.width, frame.height), (800, 600));
         assert_eq!(frame.rgba, source.rgba);
     }
@@ -737,7 +1000,7 @@ mod tests {
 
     #[test]
     fn encoder_emits_annex_b_and_an_idr_first() {
-        let mut encoder = DesktopEncoder::new().expect("encoder");
+        let mut encoder = DesktopEncoder::new(StreamProfile::SAFE_720P30).expect("encoder");
         let frame = solid(320, 240);
 
         let mut saw_idr = false;
@@ -978,7 +1241,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live display; run manually on the dev machine"]
     async fn screen_source_smoke_on_a_live_display() {
-        let mut source = ScreenSource::new().await.expect("live display");
+        // The primary monitor via the new factory — the same path `main.rs`
+        // takes, so this stays a real end-to-end regression for the Wayland
+        // black-screen bug.
+        let id = default_source_id(false, "primary").expect("a primary monitor");
+        let mut source = source_for(&id, StreamProfile::SAFE_720P30)
+            .await
+            .expect("live display");
         let frame = source
             .next_frame()
             .unwrap()
@@ -1022,7 +1291,15 @@ mod tests {
         let (stop_tx, stop_rx) = watch::channel(false);
         let source = Box::new(TestPatternSource::new(64, 48));
 
-        let result = run_stream(source, unbound_track(), 1234, 96, stop_rx).await;
+        let result = run_stream(
+            source,
+            unbound_track(),
+            1234,
+            96,
+            StreamProfile::SAFE_720P30,
+            stop_rx,
+        )
+        .await;
         let err = result.expect_err("writing to an unbound track must surface an error");
         let chain = format!("{err:#}");
         assert!(
@@ -1043,11 +1320,149 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            run_stream(source, unbound_track(), 1234, 96, stop_rx),
+            run_stream(
+                source,
+                unbound_track(),
+                1234,
+                96,
+                StreamProfile::SAFE_720P30,
+                stop_rx,
+            ),
         )
         .await
         .expect("run_stream must exit promptly when stop is already set");
         assert!(result.is_ok());
         drop(stop_tx);
+    }
+
+    /// An id with an unknown scheme is refused without touching the display, so
+    /// this runs in headless CI (unlike the enumeration-miss case below).
+    #[tokio::test]
+    async fn source_for_rejects_an_unknown_scheme() {
+        // `.err()` rather than `.unwrap_err()`: the success type is
+        // `Box<dyn FrameSource>`, which is not `Debug`.
+        let err = source_for("bogus:1", StreamProfile::SAFE_720P30)
+            .await
+            .err()
+            .expect("an unknown scheme must be refused");
+        assert!(format!("{err:#}").contains("unknown source"));
+    }
+
+    /// A well-formed id that names no live monitor is refused too. Enumeration
+    /// runs first, so this needs a live display; run manually on the dev machine.
+    #[tokio::test]
+    #[ignore = "needs a live display; run manually on the dev machine"]
+    async fn source_for_rejects_an_id_absent_from_the_enumeration() {
+        let err = source_for("monitor:999999", StreamProfile::SAFE_720P30)
+            .await
+            .err()
+            .expect("an id absent from the enumeration must be refused");
+        assert!(format!("{err:#}").contains("unknown source"));
+    }
+
+    #[test]
+    fn downscale_uses_the_profile_box() {
+        // 1080p passthrough under the 1080p30 profile; boxed under 720p30.
+        let frame = downscale(&solid(1920, 1080), 1920, 1080);
+        assert_eq!((frame.width, frame.height), (1920, 1080));
+        let boxed = downscale(&solid(1920, 1080), 1280, 720);
+        assert_eq!((boxed.width, boxed.height), (1280, 720));
+    }
+
+    /// `enumerate_sources` needs a live display; run manually on the dev machine.
+    #[test]
+    #[ignore = "needs a live display; run manually on the dev machine"]
+    fn enumerate_sources_lists_at_least_one_monitor() {
+        let sources = enumerate_sources().expect("a live display");
+        assert!(sources.iter().any(|s| s.kind == SourceKind::Monitor));
+        // `id` is stable across two calls (spec §6.5).
+        let again = enumerate_sources().expect("a live display");
+        let ids: Vec<_> = sources.iter().map(|s| s.id.clone()).collect();
+        let ids_again: Vec<_> = again.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, ids_again);
+    }
+
+    /// `WindowSource` is a `FrameSource` with real teardown, so it needs the same
+    /// headless seam `ScreenSource` has (`from_parts_for_test`, line 390): the
+    /// capture thread is the only platform-specific part, and the channel
+    /// plumbing on either side of it is what this test pins — a queued frame is
+    /// returned once, the queue then drains, and `stop` takes the sender so a
+    /// subsequent call is a clean `None` (never a panic on a dead thread).
+    #[test]
+    fn window_source_forwards_frames_and_stops_cleanly() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<()>();
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<xcap::Frame>();
+        // Pre-queue the frame the capture thread would produce, so `next_frame`'s
+        // drain is deterministic: the real thread pushes asynchronously, but the
+        // request/reply plumbing is the part this test pins.
+        frame_tx
+            .send(xcap::Frame::new(4, 4, vec![7u8; 64]))
+            .unwrap();
+        // A stub responder standing in for the capture thread: it drains requests
+        // and ends when `stop` drops the request sender.
+        let responder = std::thread::spawn(move || while request_rx.recv().is_ok() {});
+        let mut source = WindowSource::from_parts_for_test(request_tx, frame_rx, responder);
+
+        let frame = source.next_frame().unwrap().expect("one queued frame");
+        assert_eq!((frame.width, frame.height), (4, 4));
+        assert_eq!(frame.rgba.len(), 64);
+        assert!(source.next_frame().unwrap().is_none(), "queue drained");
+
+        // `stop` drops the request sender, so the responder's `recv` returns Err
+        // and the thread ends; the join in `stop` must complete rather than hang.
+        source.stop();
+        assert!(
+            source.next_frame().unwrap().is_none(),
+            "stopped source yields nothing"
+        );
+    }
+
+    /// Watch item from the ADR-23 spike (spec §3.7): the spike used
+    /// `CameraVideoRealTime` because `ScreenContentRealTime` forces scene-change
+    /// detection on, which the spike author expected to emit an IDR every frame.
+    /// The production encoder uses `ScreenContentRealTime`, so this pins what it
+    /// actually does — the ADR-24 fallback's one-IDR assumption depends on it.
+    ///
+    /// **The watch item FIRED (measured 2026-10-03).** The assertion below is
+    /// the plan's original and is deliberately left unchanged; the test is
+    /// `#[ignore]`d only so Task 3's commit stays green pending the PM's
+    /// decision on ADR-24. Measurements against `DesktopEncoder::new`
+    /// (`ScreenContentRealTime`): varying height (this test's frames, cropped)
+    /// gives 2 IDRs after frame 0 — one per resolution change, not a clean
+    /// scene-change signal; constant 320×240 with varying content gives 5 IDRs
+    /// (one per frame); constant 320×240 with constant content gives 0 IDRs.
+    /// So `ScreenContentRealTime` emits an IDR on every content change — near
+    /// per-frame for real desktop content — which invalidates ADR-24's
+    /// "one IDR on a resolution change" bitrate analysis. Raised to the PM
+    /// before Task 4b, as this test's own note requires.
+    #[test]
+    #[ignore = "watch item fired: see the note above; pending PM ruling on ADR-24"]
+    fn screen_content_usage_emits_an_idr_only_on_the_first_frame() {
+        let mut encoder = DesktopEncoder::new(StreamProfile::SAFE_720P30).expect("encoder");
+        // A moving frame each round, so a scene-change detector has something to
+        // fire on. Count IDRs (NAL type 5) across rounds 1..=5.
+        let mut idrs_after_first = 0;
+        for round in 0..6 {
+            let frame = solid(320, 240 + round); // odd height: encode() asserts even, so crop
+            let frame = crop_to_even(frame);
+            let data = encoder.encode(&frame).expect("encode");
+            if round == 0 {
+                continue; // the first access unit is allowed to be an IDR
+            }
+            let mut i = 0;
+            while i + 5 <= data.len() {
+                if data[i..i + 4] == [0, 0, 0, 1] && (data[i + 4] & 0x1F) == 5 {
+                    idrs_after_first += 1;
+                }
+                i += 1;
+            }
+        }
+        // If this fails, `ScreenContentRealTime` DOES emit an IDR per frame:
+        // record it in the PR body and raise it to the PM before Task 4b, because
+        // it invalidates ADR-24's "one IDR on a resolution change" analysis.
+        assert_eq!(
+            idrs_after_first, 0,
+            "ScreenContentRealTime emitted {idrs_after_first} IDR(s) after frame 0"
+        );
     }
 }
