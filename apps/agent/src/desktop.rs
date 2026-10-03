@@ -14,8 +14,14 @@ use openh264::encoder::{
 };
 use openh264::formats::{RgbaSliceU8, YUVBuffer};
 use openh264::OpenH264API;
+use openh264_sys2::{
+    SBitrateInfo, ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SPATIAL_LAYER_0,
+    SPATIAL_LAYER_ALL,
+};
 use rtc::media::Sample;
 use rtc::rtp_transceiver::{PayloadType, SSRC};
+use std::os::raw::c_int;
+use std::ptr::addr_of_mut;
 use tokio::sync::{oneshot, watch};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 
@@ -740,13 +746,19 @@ fn frame_content(frame: &RawFrame) -> (f64, [f64; 3]) {
 ///
 /// `ssrc`/`payload_type` are resolved by the caller from the negotiated sender
 /// (§6.3) and are never hardcoded.
+// Eight parameters: source, track, ssrc, payload type, profile, the control
+// receiver, the events sender, and the stop signal. They are the loop's whole
+// input surface; bundling them into a struct would only move the same fields
+// behind one more name. `run_desktop_session` carries the same allow.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_stream(
     mut source: Box<dyn FrameSource>,
     track: Arc<TrackLocalStaticSample>,
     ssrc: SSRC,
     payload_type: PayloadType,
-    profile: StreamProfile,
+    mut profile: StreamProfile,
     mut control: tokio::sync::mpsc::Receiver<StreamControl>,
+    events: tokio::sync::mpsc::Sender<StreamEvent>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     // `changed()` only resolves on the *next* send, so a signal that is
@@ -762,9 +774,26 @@ pub async fn run_stream(
 
     let mut skipped: u64 = 0;
     let mut encoded: u64 = 0;
+    // The last encoded frame's dimensions — what `desktop-stats` reports, so
+    // the UI's "1920×1080" reflects what is actually on the wire.
+    let mut encoded_size = (profile.max_width, profile.max_height);
     // Set once the control sender is gone, so the `select!` arm is disabled and
     // the loop cannot spin on a closed channel (a `continue` on `None` would).
     let mut control_closed = false;
+    // Best-effort: a full events channel must never stall the stream.
+    let send_stats = |events: &tokio::sync::mpsc::Sender<StreamEvent>,
+                      size: (u32, u32),
+                      profile: StreamProfile,
+                      status: Option<StatsStatus>| {
+        let stats = DesktopStats {
+            width: size.0,
+            height: size.1,
+            fps: profile.fps,
+            target_bitrate_bps: profile.bitrate_bps,
+            status,
+        };
+        let _ = events.try_send(StreamEvent::Stats(stats));
+    };
     loop {
         tokio::select! {
             _ = stop.changed() => {
@@ -775,8 +804,16 @@ pub async fn run_stream(
             command = control.recv(), if !control_closed => {
                 match command {
                     Some(StreamControl::SetBitrate(bps)) => {
-                        // Task 4b implements this arm.
-                        tracing::debug!(bps, "desktop: bitrate command received");
+                        match encoder.apply_bitrate(bps) {
+                            Ok(()) => {
+                                profile.bitrate_bps = bps;
+                                // Reflect the effective value to the UI (spec §2.3 step 6).
+                                send_stats(&events, encoded_size, profile, None);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, bps, "desktop: bitrate retarget failed");
+                            }
+                        }
                     }
                     Some(StreamControl::SourceSwap(id)) => {
                         // Task 4c implements this arm.
@@ -796,6 +833,12 @@ pub async fn run_stream(
                 let frame = crop_to_even(downscale(&frame, profile.max_width, profile.max_height));
                 let data = encoder.encode(&frame)?;
                 encoded += 1;
+                encoded_size = (frame.width, frame.height);
+                // The UI gets one stats frame as soon as the stream is live
+                // (spec §2.3 step 6), then on every retarget.
+                if encoded == 1 {
+                    send_stats(&events, encoded_size, profile, None);
+                }
                 // Diagnostic for the black-video hunt: distinguishes a blank
                 // *capture* (nonblack ~0) from a *skipped* encode (nonblack high
                 // but `bytes` 0). Guarded by the level so the per-pixel scan
@@ -857,6 +900,9 @@ fn drain_latest(receiver: &Receiver<xcap::Frame>) -> Option<xcap::Frame> {
 /// (`YUVBuffer`) before encoding.
 pub struct DesktopEncoder {
     encoder: Encoder,
+    /// The target the encoder is currently configured for; `apply_bitrate`
+    /// compares against it to decide whether the raise path is needed.
+    bitrate_bps: u32,
 }
 
 impl DesktopEncoder {
@@ -880,7 +926,10 @@ impl DesktopEncoder {
             .vui(VuiConfig::bt709());
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .context("creating the H.264 encoder")?;
-        Ok(Self { encoder })
+        Ok(Self {
+            encoder,
+            bitrate_bps: profile.bitrate_bps,
+        })
     }
 
     /// Encodes one frame to Annex-B bytes (each NAL carries its own start
@@ -902,6 +951,60 @@ impl DesktopEncoder {
             .encode(&yuv)
             .map_err(|e| anyhow::anyhow!("H.264 encode failed: {e}"))?;
         Ok(bitstream.to_vec())
+    }
+
+    /// Retarget the encoder in place (ADR-23, spike §3.7).
+    ///
+    /// No rebuild, no keyframe blip. **Raising** above the current target needs
+    /// `ENCODER_OPTION_MAX_BITRATE` on `SPATIAL_LAYER_0` first — setting the
+    /// top-level max alone leaves the per-layer max below the new target and
+    /// `WelsBitRateVerification` refuses the next call with `rc = 1`.
+    /// **Lowering** needs only the single `ENCODER_OPTION_BITRATE` call.
+    pub fn apply_bitrate(&mut self, target_bps: u32) -> Result<()> {
+        let target = target_bps as c_int;
+        unsafe {
+            let raw = self.encoder.raw_api();
+            if target > self.bitrate_bps as c_int {
+                let mut max = SBitrateInfo {
+                    iLayer: SPATIAL_LAYER_0,
+                    iBitrate: target,
+                };
+                let rc = raw.set_option(ENCODER_OPTION_MAX_BITRATE, addr_of_mut!(max).cast());
+                if rc != 0 {
+                    bail!("set_option(MAX_BITRATE, LAYER_0, {target}) failed with rc = {rc}");
+                }
+            }
+            let mut info = SBitrateInfo {
+                iLayer: SPATIAL_LAYER_ALL,
+                iBitrate: target,
+            };
+            let rc = raw.set_option(ENCODER_OPTION_BITRATE, addr_of_mut!(info).cast());
+            if rc != 0 {
+                bail!("set_option(BITRATE, ALL, {target}) failed with rc = {rc}");
+            }
+        }
+        self.bitrate_bps = target_bps;
+        Ok(())
+    }
+
+    /// The target the encoder reports for `SPATIAL_LAYER_ALL` (test-only probe).
+    #[cfg(test)]
+    fn reported_bitrate_bps(&mut self) -> i32 {
+        unsafe {
+            let mut info = SBitrateInfo {
+                iLayer: SPATIAL_LAYER_ALL,
+                iBitrate: 0,
+            };
+            let rc = self
+                .encoder
+                .raw_api()
+                .get_option(ENCODER_OPTION_BITRATE, addr_of_mut!(info).cast());
+            if rc == 0 {
+                info.iBitrate
+            } else {
+                -1
+            }
+        }
     }
 }
 
@@ -1006,6 +1109,58 @@ pub fn frame_desktop_sources(sources: &[DesktopSourceInfo], timestamp_ms: i64) -
         timestamp: timestamp_ms,
     };
     serde_json::to_string(&message).expect("a frame of plain data cannot fail to serialize")
+}
+
+/// Telemetry the agent pushes for the UI (spec §2.2/§5.1).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopStats {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub target_bitrate_bps: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatsStatus>,
+}
+
+/// An agent→browser note attached to a stats frame (spec §2.2).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct StatsStatus {
+    pub kind: StatsStatusKind,
+    pub detail: String,
+}
+
+/// The two note kinds on the wire (spec §2.2). `kebab-case` matches the
+/// TypeScript union exactly.
+///
+/// `SelectRefused` is constructed by Task 4c (the source-swap refusal path) and
+/// `QualityDowngraded` by Task 4d (the sustain fallback), so until those land
+/// neither variant has a producer — the wire contract must exist first, hence
+/// the allow.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatsStatusKind {
+    SelectRefused,
+    QualityDowngraded,
+}
+
+/// Something `run_stream` needs the dispatcher to put on the wire.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Forward as a `desktop-stats` control frame.
+    Stats(DesktopStats),
+}
+
+/// Frame telemetry as a `desktop-stats` control message (spec §2.2).
+pub fn frame_desktop_stats(stats: &DesktopStats, timestamp_ms: i64) -> String {
+    let message = crate::pty::DataChannelMessage {
+        r#type: "desktop-stats".to_string(),
+        channel: "control".to_string(),
+        payload: stats.clone(),
+        timestamp: timestamp_ms,
+    };
+    serde_json::to_string(&message).expect("a stats frame cannot fail to serialize")
 }
 
 #[cfg(test)]
@@ -1411,6 +1566,7 @@ mod tests {
         let (stop_tx, stop_rx) = watch::channel(false);
         let source = Box::new(TestPatternSource::new(64, 48));
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel::<StreamControl>(1);
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel::<StreamEvent>(1);
 
         let result = run_stream(
             source,
@@ -1419,6 +1575,7 @@ mod tests {
             96,
             StreamProfile::SAFE_720P30,
             control_rx,
+            events_tx,
             stop_rx,
         )
         .await;
@@ -1440,6 +1597,7 @@ mod tests {
         let (stop_tx, stop_rx) = watch::channel(true);
         let source = Box::new(TestPatternSource::new(64, 48));
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel::<StreamControl>(1);
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel::<StreamEvent>(1);
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -1450,6 +1608,7 @@ mod tests {
                 96,
                 StreamProfile::SAFE_720P30,
                 control_rx,
+                events_tx,
                 stop_rx,
             ),
         )
@@ -1675,5 +1834,95 @@ mod tests {
         // The camelCase wire spelling, not the Rust field name.
         assert!(value["payload"]["sources"][0].get("scaleFactor").is_some());
         assert!(value["payload"]["sources"][0].get("scale_factor").is_none());
+    }
+
+    #[test]
+    fn apply_bitrate_raises_in_place_and_echoes_the_new_target() {
+        let mut encoder = DesktopEncoder::new(StreamProfile::SAFE_720P30).expect("encoder");
+        // openh264's wrapper initializes the underlying encoder lazily inside
+        // the first `encode()`, so `SetOption` before that returns
+        // `cmInitExpected` (rc = 4). Production retargets mid-stream (the
+        // spike did it at frame 60), so prime one frame first.
+        let frame = crop_to_even(solid(320, 240));
+        let _ = encoder.encode(&frame).expect("prime");
+        // 4 Mbps -> 6 Mbps is a raise, so this is also the ordering guard: with
+        // the MAX_BITRATE-on-layer-0 step omitted, the BITRATE call fails with
+        // rc = 1 (spike §3.7) and `apply_bitrate` returns Err.
+        encoder.apply_bitrate(6_000_000).expect("raise");
+        assert_eq!(encoder.reported_bitrate_bps(), 6_000_000);
+    }
+
+    #[test]
+    fn apply_bitrate_lowers_in_place_with_the_single_call() {
+        let mut encoder = DesktopEncoder::new(StreamProfile::DEFAULT_1080P30).expect("encoder");
+        let frame = crop_to_even(solid(320, 240));
+        let _ = encoder.encode(&frame).expect("prime");
+        encoder.apply_bitrate(1_000_000).expect("lower");
+        assert_eq!(encoder.reported_bitrate_bps(), 1_000_000);
+    }
+
+    #[test]
+    fn apply_bitrate_does_not_add_an_idr_to_the_next_frame() {
+        // ADR-23's whole point is "no blip". Whether the production usage type
+        // emits an IDR per frame is the Task 3 watch item, so this asserts the
+        // weaker, always-true property: the retarget does not make an IDR
+        // *appear* on a frame that would otherwise have had none.
+        let mut encoder = DesktopEncoder::new(StreamProfile::SAFE_720P30).expect("encoder");
+        let frame = crop_to_even(solid(320, 240));
+        let _ = encoder.encode(&frame).expect("first");
+        let before = has_idr(&encoder.encode(&frame).expect("second"));
+        encoder.apply_bitrate(6_000_000).expect("raise");
+        let after = has_idr(&encoder.encode(&frame).expect("third"));
+        assert!(
+            before || !after,
+            "apply_bitrate introduced an IDR on a frame that had none"
+        );
+    }
+
+    /// True when the Annex-B byte stream contains an IDR NAL (type 5).
+    fn has_idr(data: &[u8]) -> bool {
+        let mut i = 0;
+        while i + 5 <= data.len() {
+            if data[i..i + 4] == [0, 0, 0, 1] && (data[i + 4] & 0x1F) == 5 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    #[test]
+    fn frame_desktop_stats_uses_the_camel_case_wire_shape() {
+        let stats = DesktopStats {
+            width: 1280,
+            height: 720,
+            fps: 30.0,
+            target_bitrate_bps: 4_000_000,
+            status: Some(StatsStatus {
+                kind: StatsStatusKind::QualityDowngraded,
+                detail: "720p (quality downgraded)".to_string(),
+            }),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&frame_desktop_stats(&stats, 3)).unwrap();
+        assert_eq!(value["type"], "desktop-stats");
+        assert_eq!(value["channel"], "control");
+        assert_eq!(value["timestamp"], 3);
+        assert_eq!(value["payload"]["targetBitrateBps"], 4_000_000);
+        assert_eq!(value["payload"]["status"]["kind"], "quality-downgraded");
+    }
+
+    #[test]
+    fn frame_desktop_stats_omits_an_absent_status() {
+        let stats = DesktopStats {
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            target_bitrate_bps: 6_000_000,
+            status: None,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&frame_desktop_stats(&stats, 1)).unwrap();
+        assert!(value["payload"].get("status").is_none());
     }
 }

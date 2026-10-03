@@ -1205,6 +1205,7 @@ async fn run_desktop_session(
     let (ssrc, payload_type) = rtc::desktop_stream_params(&media).await?;
 
     let (control_tx, control_rx) = mpsc::channel::<desktop::StreamControl>(16);
+    let (events_tx, mut events_rx) = mpsc::channel::<desktop::StreamEvent>(16);
 
     // The enumeration the picker shows. In test mode it is synthesised (CI is
     // headless and must not touch xcap); on a real host it is the live
@@ -1248,25 +1249,42 @@ async fn run_desktop_session(
             tracing::debug!(error = %e, "sending desktop-sources failed");
             return;
         }
-        while let Some(event) = dc.poll().await {
-            match event {
-                DataChannelEvent::OnMessage(message) => {
-                    let Ok(text) = std::str::from_utf8(&message.data) else {
-                        tracing::debug!("ignoring a non-UTF-8 control frame");
-                        continue;
-                    };
-                    match desktop::decode_control(text) {
-                        Ok(Some(control)) => {
-                            if control_tx.send(control).await.is_err() {
-                                break;
+        loop {
+            tokio::select! {
+                event = dc.poll() => match event {
+                    Some(DataChannelEvent::OnMessage(message)) => {
+                        let Ok(text) = std::str::from_utf8(&message.data) else {
+                            tracing::debug!("ignoring a non-UTF-8 control frame");
+                            continue;
+                        };
+                        match desktop::decode_control(text) {
+                            Ok(Some(control)) => {
+                                if control_tx.send(control).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::debug!(error = %e, "dropping a malformed control frame")
                             }
                         }
-                        Ok(None) => {}
-                        Err(e) => tracing::debug!(error = %e, "dropping a malformed control frame"),
+                    }
+                    Some(DataChannelEvent::OnClose) | None => break,
+                    _ => {}
+                },
+                // `Some(..)` pattern: once the stream drops its sender the
+                // branch is disabled, so a closed channel cannot spin.
+                Some(event) = events_rx.recv() => {
+                    let frame = match event {
+                        desktop::StreamEvent::Stats(stats) => {
+                            desktop::frame_desktop_stats(&stats, crate::pty::now_ms())
+                        }
+                    };
+                    if let Err(e) = dc.send_text(&frame).await {
+                        tracing::debug!(error = %e, "sending a desktop-stats frame failed");
+                        break;
                     }
                 }
-                DataChannelEvent::OnClose => break,
-                _ => {}
             }
         }
         // The control channel is this desktop session's only data channel, so
@@ -1288,6 +1306,7 @@ async fn run_desktop_session(
         payload_type,
         cfg.desktop_profile,
         control_rx,
+        events_tx,
         stop_rx,
     ));
 
