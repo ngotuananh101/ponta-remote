@@ -1022,9 +1022,13 @@ pub mod platform {
     /// on all five agent targets.
     fn map_code(code: &str) -> Option<enigo::Key> {
         use enigo::Key;
-        // Letters/digits → `Unicode` (see the doc note above). The frame's
-        // `modifiers` are NOT replayed here — the browser sends the modifier keys
-        // themselves as `key` frames (ADR-28), so enigo sees the real order.
+        // Printable single characters → `Unicode` (see the doc note above). This
+        // covers letters, digits, AND punctuation: enigo has no cross-platform
+        // named variant for `,` `.` `/` etc. (`OEMComma`/`OEMPeriod`/`OEMMinus`
+        // are `#[cfg(target_os = "windows")]`-only), so `Unicode` is the only
+        // mapping that compiles everywhere. The frame's `modifiers` are NOT
+        // replayed here — the browser sends the modifier keys themselves as
+        // `key` frames (ADR-28), so enigo sees the real order.
         let ch = match code {
             "KeyA" => 'a', "KeyB" => 'b', "KeyC" => 'c', "KeyD" => 'd',
             "KeyE" => 'e', "KeyF" => 'f', "KeyG" => 'g', "KeyH" => 'h',
@@ -1036,6 +1040,14 @@ pub mod platform {
             "Digit0" => '0', "Digit1" => '1', "Digit2" => '2', "Digit3" => '3',
             "Digit4" => '4', "Digit5" => '5', "Digit6" => '6', "Digit7" => '7',
             "Digit8" => '8', "Digit9" => '9',
+            // Punctuation. Without these, `,` `.` `/` `;` `'` `` ` `` `[` `]`
+            // `\` `-` `=` would hit `_ => return None` and be silently dropped —
+            // a real gap when typing into a text field. (`!` `@` `(` … still
+            // arrive via Shift+Digit, so only the unshifted punctuation is here.)
+            "Comma" => ',', "Period" => '.', "Slash" => '/', "Semicolon" => ';',
+            "Quote" => '\'', "Backquote" => '`', "BracketLeft" => '[',
+            "BracketRight" => ']', "Backslash" => '\\', "Minus" => '-',
+            "Equal" => '=',
             _ => '\0',
         };
         if ch != '\0' {
@@ -1084,6 +1096,10 @@ pub mod platform {
             // macOS. Do not "optimise" this back to the letter variants.
             assert_eq!(map_code("KeyA"), Some(Key::Unicode('a')));
             assert_eq!(map_code("Digit3"), Some(Key::Unicode('3')));
+            // Punctuation also goes through `Unicode` (no cross-platform named
+            // variant exists) — without it `,` `.` `=` etc. would be dropped.
+            assert_eq!(map_code("Comma"), Some(Key::Unicode(',')));
+            assert_eq!(map_code("Equal"), Some(Key::Unicode('=')));
             // Named keys use their dedicated cross-platform variants; the
             // right-hand modifiers are the `R*` ones.
             assert_eq!(map_code("Enter"), Some(Key::Return));
@@ -1837,7 +1853,7 @@ Then the test:
 
 > **Why the exact point, not "moved".** Warping to `0,0` then asserting `320,180` proves the *whole* pipeline — normalized intent → `to_absolute` → enigo → XTest → the real X seat. Asserting only "left the origin" cannot distinguish a correct map from a wrong one (e.g. a transposed axis or an off-by-scale error would still leave `0,0`). The `test` source's `x/y = 0` and `scaleFactor = 1.0` make `320,180` the exact expected pixel.
 >
-> **Local X11 caveat.** Run on a real X session (not Xvfb), this test warps the operator's actual pointer to `0,0` and then `320,180`. That is acceptable for an E2E that must prove real-seat injection; it runs by default only in the CI job (Step 5) and locally only when the operator runs `test:e2e` deliberately.
+> **Local X11 caveat.** Run on a real X session (not Xvfb), this test warps the operator's actual pointer to `0,0` and then `320,180`. That is acceptable for an E2E that must prove real-seat injection; it runs by default only in the CI job (Step 5) and locally only when the operator runs `test:e2e` deliberately. On a **Wayland** host (the common dev default), running this test locally will **fail as expected** — the ADR-27 finding is that the default enigo build is a silent no-op through Xwayland. Run it locally under `xvfb-run -a pnpm --filter @ponter/webrtc-core test:e2e`, or expect the known no-op failure — it is **not** a regression. CI always runs under Xvfb, so the gate is unaffected.
 
 > **The §8.3 fallback, if XTest is unavailable under CI's Xvfb (spec §3.5, §8.3).** If `xdotool`/XTest cannot drive the seat, the test asserts the **injector call** instead, via a test-only seam: gate the `PlatformInjector` behind `#[cfg(feature = "test-injector")]` with a `CountingInjector`, expose the count on a debug line, and assert it. Record in the PR body **which** path was taken. Real-seat injection is then covered by the manual demo (Task 7). This is a stated, bounded trade-off — not a silent skip. The gate-closed test (Step 3) is unaffected either way.
 
