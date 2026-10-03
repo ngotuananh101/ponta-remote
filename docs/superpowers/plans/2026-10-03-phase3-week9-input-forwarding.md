@@ -1005,37 +1005,91 @@ pub mod platform {
         }
     }
 
-    /// Physical `KeyboardEvent.code` → `enigo::Key` (ADR-28). Covers letters,
-    /// digits, and the common control/navigation keys; `None` for an unknown
-    /// code, which the caller logs and drops (fail-soft, spec §6.3).
+    /// Physical `KeyboardEvent.code` → `enigo::Key` (ADR-28). Letters and digits
+    /// map through `Key::Unicode`; the common control/navigation keys use their
+    /// dedicated variants. `None` for an unknown code, which the caller logs and
+    /// drops (fail-soft, spec §6.3).
+    ///
+    /// **Do not replace the `Unicode` path with `enigo::Key::A`..`Key::Z` or a
+    /// `Digit0`..`Digit9` variant.** In enigo 0.6.1 the letter variants are
+    /// `#[cfg(target_os = "windows")]`-only (referencing them on Linux/macOS
+    /// does not compile) and there is **no** `DigitN` variant at all. Routing
+    /// printable characters through `Unicode` is the only mapping that compiles
+    /// on all five agent targets.
     fn map_code(code: &str) -> Option<enigo::Key> {
         use enigo::Key;
+        // Letters/digits → `Unicode` (see the doc note above). The frame's
+        // `modifiers` are NOT replayed here — the browser sends the modifier keys
+        // themselves as `key` frames (ADR-28), so enigo sees the real order.
+        let ch = match code {
+            "KeyA" => 'a', "KeyB" => 'b', "KeyC" => 'c', "KeyD" => 'd',
+            "KeyE" => 'e', "KeyF" => 'f', "KeyG" => 'g', "KeyH" => 'h',
+            "KeyI" => 'i', "KeyJ" => 'j', "KeyK" => 'k', "KeyL" => 'l',
+            "KeyM" => 'm', "KeyN" => 'n', "KeyO" => 'o', "KeyP" => 'p',
+            "KeyQ" => 'q', "KeyR" => 'r', "KeyS" => 's', "KeyT" => 't',
+            "KeyU" => 'u', "KeyV" => 'v', "KeyW" => 'w', "KeyX" => 'x',
+            "KeyY" => 'y', "KeyZ" => 'z',
+            "Digit0" => '0', "Digit1" => '1', "Digit2" => '2', "Digit3" => '3',
+            "Digit4" => '4', "Digit5" => '5', "Digit6" => '6', "Digit7" => '7',
+            "Digit8" => '8', "Digit9" => '9',
+            _ => '\0',
+        };
+        if ch != '\0' {
+            return Some(Key::Unicode(ch));
+        }
+
+        // Fixed keys with dedicated cross-platform enigo variants. The
+        // right-hand modifiers are the `R*` variants (`RShift`/`RControl`).
         let key = match code {
             "Enter" => Key::Return,
             "Escape" => Key::Escape,
             "Backspace" => Key::Backspace,
             "Tab" => Key::Tab,
             "Space" => Key::Space,
+            "Delete" => Key::Delete,
             "ArrowUp" => Key::UpArrow,
             "ArrowDown" => Key::DownArrow,
             "ArrowLeft" => Key::LeftArrow,
             "ArrowRight" => Key::RightArrow,
-            "ShiftLeft" | "ShiftRight" => Key::Shift,
-            "ControlLeft" | "ControlRight" => Key::Control,
+            "Home" => Key::Home,
+            "End" => Key::End,
+            "PageUp" => Key::PageUp,
+            "PageDown" => Key::PageDown,
+            "ShiftLeft" => Key::Shift,
+            "ShiftRight" => Key::RShift,
+            "ControlLeft" => Key::Control,
+            "ControlRight" => Key::RControl,
             "AltLeft" | "AltRight" => Key::Alt,
             "MetaLeft" | "MetaRight" => Key::Meta,
-            // "KeyA".."KeyZ" and "Digit0".."Digit9" cover the printable set the
-            // `text` frame does not (it carries committed unicode).
-            other => {
-                let c = other
-                    .strip_prefix("Key")
-                    .and_then(|s| s.chars().next())
-                    .map(|c| c.to_ascii_lowercase())
-                    .or_else(|| other.strip_prefix("Digit").and_then(|s| s.chars().next()))?;
-                Key::Unicode(c)
-            }
+            "CapsLock" => Key::CapsLock,
+            _ => return None,
         };
         Some(key)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::map_code;
+        use enigo::Key;
+
+        #[test]
+        fn map_code_routes_letters_and_digits_through_unicode() {
+            // Letters/digits MUST go through `Key::Unicode`: `enigo::Key::A` is
+            // `#[cfg(target_os = "windows")]`-only and there is no `DigitN`
+            // variant, so `Key::A`/`Key::Digit0` would not compile on Linux or
+            // macOS. Do not "optimise" this back to the letter variants.
+            assert_eq!(map_code("KeyA"), Some(Key::Unicode('a')));
+            assert_eq!(map_code("Digit3"), Some(Key::Unicode('3')));
+            // Named keys use their dedicated cross-platform variants; the
+            // right-hand modifiers are the `R*` ones.
+            assert_eq!(map_code("Enter"), Some(Key::Return));
+            assert_eq!(map_code("ShiftLeft"), Some(Key::Shift));
+            assert_eq!(map_code("ShiftRight"), Some(Key::RShift));
+            assert_eq!(map_code("ControlRight"), Some(Key::RControl));
+            assert_eq!(map_code("CapsLock"), Some(Key::CapsLock));
+            // Unknown codes fail soft (drop, not panic) — spec §6.3.
+            assert_eq!(map_code("Nope"), None);
+        }
     }
 }
 ```
