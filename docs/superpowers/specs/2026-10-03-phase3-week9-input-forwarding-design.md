@@ -115,7 +115,7 @@ All facts below were verified against repository state or vendor documentation �
 
 - A repository-wide grep and a scan of the cargo registry cache found **no** input-injection crate: `apps/agent/Cargo.lock` contains **0** occurrences of `enigo`, and the registry cache holds no `enigo` / `rdev` / `inputbot` / `uinput` source. The only vendored crate is `apps/agent/vendor/xcap` (capture, not injection).
 - The agent's dependency set (`apps/agent/Cargo.toml:7-20`) is base64/clap/rtc/webrtc/tokio/portable-pty plus the desktop-only `bytes`/`openh264`/`xcap` (`:34-35`). Nothing injects input today.
-- **Consequence.** Week 9 introduces the **first** input dependency. Like `xcap`/`openh264`, it must be gated `cfg(not(target_env = "musl"))` (`Cargo.toml:28-35`) so the musl artifact stays terminal-only, and it will need the same vendoring/offline consideration `xcap` got (`apps/agent/vendor/xcap/PATCH.md`). The candidate set is recorded in ADR-27.
+- **Consequence.** Week 9 introduces the **first** input dependency. Like `xcap`/`openh264`, it must be gated `cfg(not(target_env = "musl"))` (`Cargo.toml:32-35`) so the musl artifact stays terminal-only, and it will need the same vendoring/offline consideration `xcap` got (`apps/agent/vendor/xcap/PATCH.md`). The candidate set is recorded in ADR-27.
 
 ### 3.2 Wayland is a first-class risk for injection (not a footnote)
 
@@ -307,7 +307,7 @@ pub fn decode_desktop_input(raw: &str) -> Result<Option<DesktopInput>>;
 
 - The decoder reuses `MAX_FRAME_BYTES` (`apps/agent/src/pty.rs:26`) as the pre-parse cap and the `DataChannelMessage<T>` envelope (`apps/agent/src/pty.rs:40`). Unlike the terminal path, the payload is **JSON, not base64** — input is structured, so there is no byte string to decode; the reuse is the guard *shape*, and the spec says so rather than implying a base64 step.
 - Coordinates are clamped to `0..=1` at decode time so a hostile frame cannot produce an out-of-range absolute point.
-- **The musl boundary is at the dependency, not the module.** `mod input` is **not** `cfg`-gated: it holds only serde types, the `decode_desktop_input` function, `to_absolute`, and the `InputInjector` trait — no heavy dependency — so it compiles on every target, exactly as `pty.rs` does. Only the **concrete injector** (enigo or per-platform, ADR-27) is gated `cfg(not(target_env = "musl"))`, and the injection dependency goes in `[target.'cfg(not(target_env = "musl"))'.dependencies]` alongside `bytes`/`openh264`/`xcap` (`apps/agent/Cargo.toml:28-35`). On musl the concrete type is simply never constructed — no desktop session exists to inject into (the dispatcher branch lives inside `run_desktop_session`, itself `#[cfg(not(target_env = "musl"))]`, `apps/agent/src/main.rs:1151`) — so no stub is required.
+- **The musl boundary is at the dependency, not the module.** `mod input` is **not** `cfg`-gated: it holds only serde types, the `decode_desktop_input` function, `to_absolute`, and the `InputInjector` trait — no heavy dependency — so it compiles on every target, exactly as `pty.rs` does. Only the **concrete injector** (enigo or per-platform, ADR-27) is gated `cfg(not(target_env = "musl"))`, and the injection dependency goes in `[target.'cfg(not(target_env = "musl"))'.dependencies]` alongside `bytes`/`openh264`/`xcap` (`apps/agent/Cargo.toml:32-35`). On musl the concrete type is simply never constructed — no desktop session exists to inject into (the dispatcher branch lives inside the non-musl `run_desktop_session`, itself `#[cfg(not(target_env = "musl"))]`, `apps/agent/src/main.rs:984-986`) — so no stub is required.
 
 ### 6.2 Normalized → absolute mapping (ADR-30)
 
@@ -409,6 +409,7 @@ Per §5.4 and §7.5, run by `pnpm test`.
 The existing `desktop.e2e.test.ts` (Week 7/8) is **extended, not replaced**, and must keep passing. Two new tests pin the gate (Linux only, `describe.skipIf(!isLinux)`):
 
 - **Gate closed (default) — the production contract.** Spawn the agent **without** `--allow-input` (the default). Send a `desktop-input` pointer-move frame; assert: (a) the agent logs the drop; (b) RTP keeps flowing (the session is unharmed); (c) `desktop-sources.inputEnabled === false`. This is the test that protects the shipped behaviour — the feature is inert unless the operator opts in.
+  - **The log assert needs a harness change.** The drop is logged at `debug` (§6.3), but `spawnAgent` hardcodes `RUST_LOG=info` (`packages/webrtc-core/test/e2e/harness.ts:426`) with no env parameter, so a `debug` line is filtered out. `spawnAgent` therefore gains an optional env override — `spawnAgent(agentId, credential, extraArgs, env?)` — merged over its fixed `{ RUST_LOG: 'info' }`, and this test passes `{ RUST_LOG: 'debug' }` and asserts `agent.output().includes('dropping desktop-input')`. **The assert is kept, not dropped:** without it the test would still pass if the frame were never delivered at all (a broken wire), so (a) is what distinguishes "received and dropped" from "never arrived". §8.5 is updated to match.
 - **Gate open (test-only opt-in) — the injection path.** Spawn the agent **with** `--allow-input` under an **Xvfb** display (`DISPLAY=:99`), using `--desktop-source test` for the stream (§3.3). Send a pointer-move to a known normalized point; assert the OS pointer moved, via `xdotool getmouselocation` (XTest under Xvfb). `desktop-sources.inputEnabled === true`.
   - **Fallback if XTest is unavailable under CI's Xvfb** (§3.5): assert the *injector call* through the `CountingInjector` seam exposed behind a test-only flag, and record that real-seat injection is covered by the manual demo instead. This is stated up front so the fallback is a known, bounded trade-off — not a surprise.
 
@@ -426,13 +427,13 @@ The gate-open test spawns the **production binary** with the flag on; only the h
 
 ### 8.5 CI changes
 
-No new workflow beyond Week 7/8's apt steps. The gate-closed test needs nothing extra. The gate-open test needs `xvfb` and `xdotool` in the E2E job's system-dependency step (the job already installs the capture stack); if adding them is undesirable, the §8.3 fallback applies and is recorded.
+No new workflow beyond Week 7/8's apt steps. The gate-closed test needs no new **CI system** dependency, but it does need the `spawnAgent` env-override described in §8.3 (a test-harness change, not a workflow change) so its `debug` log assert is observable. The gate-open test needs `xvfb` and `xdotool` in the E2E job's system-dependency step (the job already installs the capture stack); if adding them is undesirable, the §8.3 fallback applies and is recorded.
 
 ### 8.6 What is verified where
 
 | Claim | Verified by |
 |---|---|
-| Gate closed ⇒ input dropped, session unharmed | E2E (§8.3, default) |
+| Gate closed ⇒ frame received, logged as dropped, session unharmed | E2E (§8.3, default; `RUST_LOG=debug` assert) |
 | Gate open ⇒ injection reaches the OS | E2E under Xvfb (§8.3) or manual demo (§8.4) |
 | Decode guard (channel/type/size) | Rust unit (§6.5) |
 | Normalized → absolute mapping | Rust unit (§6.5) |
@@ -502,7 +503,7 @@ The gate is a holding pattern, not a fix. The audit findings behind it:
 
 1. `cargo test --locked` passes with the new unit tests on Linux — the `Build Agent / Verify` gate; the musl target still builds with no input dependency — the `Build Agent / Linux/x64-musl` gate.
 2. `pnpm lint && pnpm typecheck && pnpm test` pass across the workspace including the new test surfaces — the `CI (Node) / Lint, Typecheck, Format & Node Tests` gate.
-3. E2E `desktop.e2e.test.ts` passes: **with the gate closed (default)**, a `desktop-input` frame is dropped, the session keeps streaming, and `desktop-sources.inputEnabled === false`; **with `--allow-input`**, a pointer-move produces an observable injection (or the recorded §8.3 fallback) and `inputEnabled === true` — the `CI (E2E) / Cross-language terminal E2E` gate.
+3. E2E `desktop.e2e.test.ts` passes: **with the gate closed (default)**, a `desktop-input` frame is received and logged as dropped (`RUST_LOG=debug` assert, §8.3), the session keeps streaming, and `desktop-sources.inputEnabled === false`; **with `--allow-input`**, a pointer-move produces an observable injection (or the recorded §8.3 fallback) and `inputEnabled === true` — the `CI (E2E) / Cross-language terminal E2E` gate.
 4. The existing terminal and Week 7/8 desktop E2E suites still pass unchanged.
 5. The recorded manual demo shows input working **only** with `--allow-input` (toggle appears, pointer/click/type land correctly) and **inert without it** (no toggle, no effect) — on X11, with the Wayland and scaled-display outcomes recorded honestly.
 6. `ARCHITECTURE.md` records the Week 9 scope, marks ADR-18 superseded, and states that input ships gated off (§11).
@@ -541,7 +542,7 @@ Reconciled in the same PR (D8):
 
 1. **Roadmap §8** (`ARCHITECTURE.md:941-944`): the "Tuần 8-9" list's input item — "Điều khiển chuột & bàn phím (input forwarding) — hiện chỉ view-only (ADR-18)" — is annotated **partial**: the wire and injection land, but **input is gated off (ADR-29)** and is not usable until WS2/WS3. The item is **not** ticked as done. The `(ADR-18)` reference becomes `(ADR-18 superseded by ADR-26; gated by ADR-29)`.
 2. **ADR-18 superseded.** The Week 7 spec's ADR-18 gains a superseded note pointing at ADR-26 (Week 9 spec), matching the roadmap annotation. The `<video>` is no longer unconditionally view-only — it is view-only *unless the gate is open*.
-3. **Perf table** (`ARCHITECTURE.md:1080-1081`): Week 8 already corrected the H.265 row; no further change is required by Week 9 (input does not alter the codec/resolution rows).
+3. **Perf table** (`ARCHITECTURE.md:1080-1081`): the row `Desktop stream (Phase 3 target) | 60fps | Hardware H.265` is **still present and still wrong** — H.265 is not viable in WebRTC (Week 8 spec §3.5). Week 8's **D8** specifies the correction (split into a Week 8 software row and a spike-gated hardware row) but **that edit has not landed**: PR #24 (`2899b39`) merged the Week 8 *spec only* and did not touch `ARCHITECTURE.md`. This is a **pending** reconciliation, not a completed one — Week 9's D8 may fold it in (the perf row does not depend on input, but leaving a known-false row in place is worse than fixing it while the docs are open), and §11.1's roadmap edits are the same situation. The spec states this so no one reads "already corrected" and skips the edit.
 4. **Security status.** The roadmap's Phase 5 workstream list (`ARCHITECTURE.md:952+`) already tracks WS1-WS5. Week 9 adds no new workstream; §9.3 records that **H3, H2, M7, M8 remain open** after the Week 9 merge, and that the gate is a holding pattern — the input feature is closed until **WS2** (peer identity, closes H3) and **WS3** (enforce `approved`, closes H2) land.
 
 Phase 4's stub (`ARCHITECTURE.md:946-948`) is **not** touched (out of scope; §1.2).
