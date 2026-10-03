@@ -125,4 +125,106 @@ describe('Admin REST Routes', () => {
     const err = await res.json();
     expect(err.code).toBe('SELF_DEACTIVATION_BLOCKED');
   });
+
+  it('allows demoting a regular user back to user while 2 active admins, then blocks demoting the last active admin', async () => {
+    const app = createApp();
+
+    // Promote regularUser to admin (now 2 active admins).
+    const promoteRes = await app.request(`/api/admin/users/${regularUser.id}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ approvalStatus: 'approved', role: 'admin' }),
+    });
+    expect(promoteRes.status).toBe(200);
+    const promoted = await promoteRes.json();
+    expect(promoted.user.role).toBe('admin');
+
+    // Demote regularUser back to user (2 active admins → allowed, RF4-03/04).
+    const demoteRes = await app.request(`/api/admin/users/${regularUser.id}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ role: 'user' }),
+    });
+    expect(demoteRes.status).toBe(200);
+    const demoted = await demoteRes.json();
+    expect(demoted.user.role).toBe('user');
+
+    // Demote adminUser (last remaining active admin → blocked, RF4-05).
+    const lastDemoteRes = await app.request(`/api/admin/users/${adminUser.id}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ role: 'user' }),
+    });
+    expect(lastDemoteRes.status).toBe(400);
+    const err = await lastDemoteRes.json();
+    expect(err.code).toBe('LAST_ADMIN_PROTECTED');
+  });
+
+  it('rejects unauthenticated admin access with 401', async () => {
+    const app = createApp();
+
+    const statsRes = await app.request('/api/admin/stats');
+    expect(statsRes.status).toBe(401);
+
+    const usersRes = await app.request('/api/admin/users?status=all');
+    expect(usersRes.status).toBe(401);
+  });
+
+  it('rejects requests from a deactivated user token with 401 UNAUTHORIZED', async () => {
+    const app = createApp();
+
+    // Deactivating another user is allowed (only self-deactivation is blocked).
+    const deactivateRes = await app.request(`/api/admin/users/${regularUser.id}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ isActive: false }),
+    });
+    expect(deactivateRes.status).toBe(200);
+
+    // regularToken was issued in beforeEach while the user was active; the
+    // auth middleware re-checks isActive on every request, so it is now rejected.
+    const statsRes = await app.request('/api/admin/stats', {
+      headers: { Authorization: `Bearer ${regularToken}` },
+    });
+    expect(statsRes.status).toBe(401);
+    const err = await statsRes.json();
+    expect(err.code).toBe('UNAUTHORIZED');
+  });
+
+  it('rejects login for a rejected user with 403 USER_REJECTED', async () => {
+    const app = createApp();
+
+    // Admin rejects regularUser (correct password, so password check passes first).
+    const rejectRes = await app.request(`/api/admin/users/${regularUser.id}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ approvalStatus: 'rejected' }),
+    });
+    expect(rejectRes.status).toBe(200);
+
+    // Login with correct credentials still fails for a rejected account.
+    const loginRes = await app.request('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'user1', password: 'Password123!' }),
+    });
+    expect(loginRes.status).toBe(403);
+    const err = await loginRes.json();
+    expect(err.code).toBe('USER_REJECTED');
+  });
 });
