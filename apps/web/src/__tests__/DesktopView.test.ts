@@ -68,4 +68,142 @@ describe('DesktopView', () => {
     wrapper.unmount();
     expect(video.srcObject).toBeNull();
   });
+
+  const twoSources = [
+    {
+      id: 'monitor:1',
+      kind: 'monitor' as const,
+      name: 'eDP-1',
+      width: 1920,
+      height: 1080,
+      x: 0,
+      y: 0,
+      scaleFactor: 1,
+      rotation: 0,
+      isPrimary: true,
+      default: true,
+    },
+    {
+      id: 'window:9',
+      kind: 'window' as const,
+      name: 'Editor',
+      width: 800,
+      height: 600,
+      x: 100,
+      y: 100,
+      scaleFactor: 1,
+      rotation: 0,
+      isPrimary: false,
+      default: false,
+    },
+  ];
+
+  it('renders the source picker only when sources are present', async () => {
+    const withoutSources = mount(DesktopView, {
+      props: { tab: desktopTab() },
+    });
+    expect(
+      withoutSources.find('[data-test="desktop-source-picker"]').exists(),
+    ).toBe(false);
+
+    const withSources = mount(DesktopView, {
+      props: {
+        tab: desktopTab({
+          desktopSources: twoSources,
+          desktopSourceId: 'monitor:1',
+        }),
+      },
+    });
+    const picker = withSources.find('[data-test="desktop-source-picker"]');
+    expect(picker.exists()).toBe(true);
+    expect(picker.findAll('option')).toHaveLength(2);
+  });
+
+  it('calls selectDesktopSource when the picker changes', async () => {
+    const store = useTerminalStore();
+    const select = vi
+      .spyOn(store, 'selectDesktopSource')
+      .mockImplementation(() => {});
+    const wrapper = mount(DesktopView, {
+      props: {
+        tab: desktopTab({
+          desktopSources: twoSources,
+          desktopSourceId: 'monitor:1',
+        }),
+      },
+    });
+
+    await wrapper
+      .find('[data-test="desktop-source-picker"]')
+      .setValue('window:9');
+
+    expect(select).toHaveBeenCalledWith('tab-1', 'window:9');
+  });
+
+  it('renders the stats line and appends a status note when present', () => {
+    const wrapper = mount(DesktopView, {
+      props: {
+        tab: desktopTab({
+          desktopStats: {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            targetBitrateBps: 4_000_000,
+            status: {
+              kind: 'quality-downgraded',
+              detail: '720p (quality downgraded)',
+            },
+          },
+        }),
+      },
+    });
+    expect(wrapper.find('[data-test="desktop-stats"]').text()).toContain(
+      '1280×720',
+    );
+    expect(wrapper.find('[data-test="desktop-stats"]').text()).toContain(
+      '30 fps',
+    );
+    expect(wrapper.find('[data-test="desktop-stats"]').text()).toContain(
+      'quality downgraded',
+    );
+  });
+
+  it('calls setDesktopBitrate from the bitrate control', async () => {
+    const store = useTerminalStore();
+    const setBitrate = vi
+      .spyOn(store, 'setDesktopBitrate')
+      .mockImplementation(() => {});
+    const wrapper = mount(DesktopView, {
+      props: {
+        tab: desktopTab({
+          desktopStats: {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            targetBitrateBps: 6_000_000,
+          },
+        }),
+      },
+    });
+
+    await wrapper.find('[data-test="desktop-bitrate"]').setValue('3000000');
+
+    expect(setBitrate).toHaveBeenCalledWith('tab-1', 3_000_000);
+  });
+
+  it('keeps the video view-only: no controls, no input handlers', () => {
+    const wrapper = mount(DesktopView, {
+      props: {
+        tab: desktopTab({
+          desktopSources: twoSources,
+          desktopSourceId: 'monitor:1',
+        }),
+      },
+    });
+    const video = wrapper.find('video');
+    // Review Focus #3: control chrome must not turn the video interactive.
+    expect(video.attributes('controls')).toBeUndefined();
+    expect(video.attributes('onmousedown')).toBeUndefined();
+    expect(video.attributes('onkeydown')).toBeUndefined();
+  });
 });
