@@ -1286,7 +1286,7 @@ git commit -m "feat(agent): resolve StreamProfile, enumerate capture sources, ad
 
 **Interfaces:**
 - Consumes: Task 3's `StreamProfile`, `enumerate_sources`, `DesktopSourceInfo`, `SourceKind`, `primary_monitor`, `ScreenSource`; `crate::pty::DataChannelMessage<T>`; `webrtc::data_channel::{DataChannel, DataChannelEvent}`.
-- Produces (relied on by Tasks 4b/4c/4d):
+- Produces (relied on by Tasks 4b/4c/4d/4e):
   - `pub const MIN_BITRATE_BPS: u32 = 250_000;` / `pub const MAX_BITRATE_BPS: u32 = 20_000_000;`
   - `pub enum StreamControl { SetBitrate(u32), SourceSwap(String) }` (`#[derive(Debug, Clone, PartialEq, Eq)]`)
   - `pub fn decode_control(raw: &str) -> Result<Option<StreamControl>>`
@@ -1728,6 +1728,21 @@ Pass it to the handler and split the peer flag:
     .await?;
 ```
 
+`build_peer` now takes five arguments, so the **other** call site must move with it. In `refuse_second_offer` (`main.rs:1256`) — the second-offer refusal path, which builds a throwaway peer with no session and therefore no control channel — add the trailing `false`:
+
+```rust
+    let peer = rtc::build_peer(
+        pushed_ice,
+        &cfg.stun,
+        Arc::new(rtc::NoopHandler),
+        false,
+        false,
+    )
+    .await?;
+```
+
+(A missed call site here is a compile error, not a silent bug — `cargo build` catches it. Both sites must carry the new arity before Step 8's test run.)
+
 - [ ] **Step 9: Spawn the desktop control dispatcher**
 
 In `run_desktop_session` (non-musl), accept `mut open_rx: tokio::sync::oneshot::Receiver<()>` as a parameter (moved in from `run_one_session`, which passes `open_rx` only on the Desktop arm — the arm `return`s, so the move is legal), then after the `run_stream` spawn:
@@ -1821,6 +1836,8 @@ const CONTROL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 ```
 
 > **`run_desktop_session` must now receive `end_tx`.** The dispatcher above is the desktop session's end-signal source, so `run_desktop_session` takes `end_tx: mpsc::Sender<&'static str>` in addition to the `end_rx` it already owns — add it to the signature and pass `end_tx.clone()` at the call site in `run_one_session` (`main.rs:626-637`), beside `end_rx`. It is a second clone of the same channel the handler already holds; capacity 1 with `try_send` keeps "the first reason wins".
+
+> **Keep the musl twin in step.** `run_desktop_session` has two definitions — the real one under `#[cfg(not(target_env = "musl"))]` and a refusing stub under `#[cfg(target_env = "musl")]` (`main.rs:1147`) — and **one shared call site** in `run_one_session`. Every parameter this task and Tasks 4b–4e add (`open_rx`, `end_tx`, and later `abr_target`) must be added to **both** signatures, with the stub prefixing the name (`_open_rx`, `_end_tx`, …) and ignoring it. A missing parameter in the stub is a musl-only compile error that the Linux `Build Agent / Verify` gate will not catch — only `Build Agent / Linux/x64-musl` will. This mirrors the `refuse_second_offer` call site: whenever a shared call site changes arity, every definition it can reach must change with it.
 
 Pass `control_rx` into `run_stream`, and add `control_task` to teardown (abort it after `stop_tx.send(true)`, alongside the existing bounded stream join):
 
@@ -2936,6 +2953,390 @@ git commit -m "feat(agent): 1080p30->720p30 sustain fallback with an anti-oscill
 
 ---
 
+### Task 4e: Agent — GCC auto-ABR wiring (D3f, the transport half)
+
+**Files:**
+- Modify: `apps/agent/src/rtc.rs` (`ABR_INITIAL_BPS`/`ABR_MIN_BPS`/`ABR_MAX_BPS`; an `abr` module with `ReportingEstimator` + `estimator()`; `build_peer` installs congestion control when `has_control` and returns `BuiltPeer`)
+- Modify: `apps/agent/src/desktop.rs` (`abr_next_target`)
+- Modify: `apps/agent/src/main.rs` (destructure `BuiltPeer` at both `build_peer` call sites; thread `abr_target` into both `run_desktop_session` twins; a dedicated auto-ABR task beside the Task 4a dispatcher; latch `manual` in the decode arm; abort the task at teardown)
+- Test: `apps/agent/src/rtc.rs`, `apps/agent/src/desktop.rs` (`#[cfg(test)] mod tests`)
+
+**Interfaces:**
+- Consumes: Task 4a's dispatcher + `control_tx` and its `MIN_BITRATE_BPS`/`MAX_BITRATE_BPS`/`StreamControl`; Task 4b's `StreamControl::SetBitrate` handling in `run_stream`; Task 3's `StreamProfile`.
+- Produces: `rtc::BuiltPeer { peer: Arc<dyn PeerConnection>, abr_target: Option<Arc<AtomicU64>> }`; `rtc::ABR_INITIAL_BPS`/`ABR_MIN_BPS`/`ABR_MAX_BPS`; `desktop::abr_next_target(estimate_bps: f64, current_bps: u32) -> Option<u32>`.
+
+> **Why this task exists (spec §2.4, §3.3, §10.3 step 4).** The spike PASSED (§3.7), so ADR-23's PASS branch is the shipped design: the spec says GCC-driven auto-ABR *ships this week* alongside manual control (§2.4), D3 lists it in `apps/agent`'s deliverable (`design.md:546`), and §10.3 step 4 names "GCC auto-ABR wiring" in the delivery sequence. It stays a **goal, not an acceptance criterion** (§10.2) — nothing here is gated — but it is in scope, so the plan carries it. This task wires the *transport* half (estimator + pacer) and feeds the estimate into the **existing** retarget path (`StreamControl::SetBitrate` → Task 4b's `apply_bitrate`), so auto and manual share one code path.
+
+> **The mechanism, and why it is a wrapper (spec §3.3).** `configure_congestion_control` takes the estimator **by value** and boxes it inside the interceptor chain, where the application cannot reach it — so the estimate must be *pushed* out, not pulled. The shipped example (`webrtc-0.21.0/examples/bandwidth-estimation-from-disk/bandwidth-estimation-from-disk.rs:126-166`) does exactly this: a `ReportingEstimator` that delegates every call and stores the target in an `AtomicU64` after each update. The plan copies that wrapper (~40 lines, the documented integration) rather than inventing one.
+
+> **`RtpSender::set_parameters` is NOT load-bearing here — a recorded deviation from §3.3.** §3.3's sentence "feeding `RtpSender::set_parameters` and the encoder target" is aspirational; verified against the vendored rtc 0.21, `RTCRtpEncodingParameters::max_bitrate` is **never read at runtime** (`grep -rn max_bitrate rtc-0.21.0/src` finds only `0` initialisers and a doc comment). The pacer is driven by the estimator's `Attribute::TargetBitrateChanged` (`rtc-interceptor-0.21.0/src/pacing/sender.rs:186-191`), not by the sender's encoding parameters. So this task does **not** call `set_parameters`: the encoder target is the only knob the application must turn, and the pacer follows the estimator on its own.
+
+> **⚠️ Desktop-SDP risk — read before implementing.** Installing congestion control registers `transport-cc` RTCP feedback and the `transport-cc` header extension on the desktop `MediaEngine` (spec §3.3), so the desktop SDP gains two attributes Week 7's did not carry. The terminal path is untouched (`has_control` gates it, spec §2.4), so this is desktop-only — but Task 6's werift E2E answers that SDP, and a werift offer that does not carry `transport-cc` could make the agent's answer include an un-offered attribute. **If Task 6 Step 3 fails on the answer's SDP, do not delete this task**: gate the install behind a CLI/env flag `--desktop-abr <on|off>` / `AGENT_DESKTOP_ABR` (default `on`) and pass `--desktop-abr off` in the E2E opener only — the real-browser demo keeps it on. Report the failure and the chosen fallback to the PM before committing.
+
+- [ ] **Step 1: Add the ABR bounds and the estimator wrapper**
+
+In `apps/agent/src/rtc.rs`, at module level — **gated to non-musl**, because the only readers are the `abr` module below and `desktop::abr_next_target`, both of which are compiled out on musl (an ungated `pub const` in a binary crate is still dead-code-checked, so it would fail `-D warnings` on the musl leg):
+
+```rust
+/// Where GCC starts (spec §3.3). Deliberately low — the safe floor, not the
+/// 1080p30 target — because a path that opens congested should not open at
+/// 6 Mbps. The dispatcher ignores the estimate until it *moves off* this seed,
+/// so the stream still starts at the session profile (spec §2.3 step 2).
+#[cfg(not(target_env = "musl"))]
+pub const ABR_INITIAL_BPS: f64 = 4_000_000.0;
+/// Never let GCC drive the encoder outside the wire boundary's clamp.
+#[cfg(not(target_env = "musl"))]
+pub const ABR_MIN_BPS: f64 = 250_000.0;
+#[cfg(not(target_env = "musl"))]
+pub const ABR_MAX_BPS: f64 = 20_000_000.0;
+```
+
+Below the `build_peer` imports, add the wrapper (desktop-only — musl has no desktop session):
+
+```rust
+/// GCC-driven auto-ABR (spec §3.3, ADR-23 PASS branch). Installed only on a
+/// peer that carries a control channel, so the terminal SDP is untouched.
+#[cfg(not(target_env = "musl"))]
+mod abr {
+    use rtc::interceptor::{BandwidthEstimator, EstimatorStats, Gcc, PacketReport};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// Delegates to `inner` and publishes its target after every update.
+    ///
+    /// `configure_congestion_control` boxes the estimator inside the chain, so
+    /// this wrapper is the one application-supplied object in the loop that can
+    /// carry the number back out (spec §3.3). Copied from the shipped example
+    /// `webrtc-0.21.0/examples/bandwidth-estimation-from-disk`.
+    pub struct ReportingEstimator<E: BandwidthEstimator> {
+        inner: E,
+        target: Arc<AtomicU64>,
+    }
+
+    impl<E: BandwidthEstimator> ReportingEstimator<E> {
+        pub fn new(inner: E) -> (Self, Arc<AtomicU64>) {
+            let target = Arc::new(AtomicU64::new(inner.target_bitrate().to_bits()));
+            let handle = Arc::clone(&target);
+            (Self { inner, target }, handle)
+        }
+
+        fn publish(&self) {
+            self.target
+                .store(self.inner.target_bitrate().to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    impl<E: BandwidthEstimator> BandwidthEstimator for ReportingEstimator<E> {
+        fn on_reports(&mut self, now: Instant, reports: &[PacketReport]) {
+            self.inner.on_reports(now, reports);
+            self.publish();
+        }
+
+        fn target_bitrate(&self) -> f64 {
+            self.inner.target_bitrate()
+        }
+
+        fn handle_timeout(&mut self, now: Instant) {
+            self.inner.handle_timeout(now);
+            self.publish();
+        }
+
+        fn poll_timeout(&self) -> Option<Instant> {
+            self.inner.poll_timeout()
+        }
+
+        fn stats(&self) -> EstimatorStats {
+            self.inner.stats()
+        }
+    }
+
+    /// A GCC estimator wrapped so its target is observable.
+    pub fn estimator() -> (ReportingEstimator<Gcc>, Arc<AtomicU64>) {
+        ReportingEstimator::new(Gcc::new(
+            super::ABR_INITIAL_BPS,
+            super::ABR_MIN_BPS,
+            super::ABR_MAX_BPS,
+        ))
+    }
+}
+```
+
+- [ ] **Step 2: Install congestion control in `build_peer` and return the handle**
+
+Add `use std::sync::atomic::AtomicU64;` **ungated** near the top of `rtc.rs` — `BuiltPeer` carries `Option<Arc<AtomicU64>>` on every target, so the import is used on musl too (the musl peer simply always gets `None`).
+
+Add `configure_congestion_control` and `CongestionFeedback` to the import list **under a non-musl gate**, because they are referenced only inside the `#[cfg(not(target_env = "musl"))]` block below — an ungated import would be unused on the musl leg and fail `-D warnings`:
+
+```rust
+#[cfg(not(target_env = "musl"))]
+use webrtc::peer_connection::{configure_congestion_control, CongestionFeedback};
+```
+
+Define the return type just above `build_peer`:
+
+```rust
+/// A built peer plus the handles the session needs from it.
+///
+/// `abr_target` is `Some` only for a peer built with congestion control — a
+/// desktop session. The terminal and refusal peers leave it `None`, so their
+/// SDP is byte-identical to Week 7 (spec §2.4).
+pub struct BuiltPeer {
+    pub peer: Arc<dyn PeerConnection>,
+    pub abr_target: Option<Arc<AtomicU64>>,
+}
+```
+
+Change the signature's return type to `Result<BuiltPeer>` and replace the media/registry prologue:
+
+```rust
+    let mut media = MediaEngine::default();
+    media
+        .register_default_codecs()
+        .context("register_default_codecs")?;
+
+    // Congestion control is desktop-only: it registers `transport-cc` feedback
+    // and a header extension on the media engine, which changes the SDP. The
+    // terminal path must stay byte-identical (spec §2.4), so it is gated on
+    // `has_control` — the same flag that decides the ICE timeouts below.
+    #[cfg(not(target_env = "musl"))]
+    let (registry, abr_target) = if has_control {
+        let (estimator, handle) = abr::estimator();
+        let registry = configure_congestion_control(
+            Registry::new(),
+            estimator,
+            CongestionFeedback::Twcc,
+            &mut media,
+        )
+        .context("configure_congestion_control")?;
+        (registry, Some(handle))
+    } else {
+        (Registry::new(), None)
+    };
+    // musl has no desktop session, so `has_control` is never true there; the
+    // peer still needs a registry, just without congestion control.
+    #[cfg(target_env = "musl")]
+    let (registry, abr_target): (Registry, Option<Arc<AtomicU64>>) = (Registry::new(), None);
+
+    let registry = register_default_interceptors(registry, &mut media)
+        .context("register_default_interceptors")?;
+```
+
+and the tail:
+
+```rust
+    Ok(BuiltPeer {
+        peer: Arc::new(peer) as Arc<dyn PeerConnection>,
+        abr_target,
+    })
+}
+```
+
+- [ ] **Step 3: Update the two `build_peer` call sites**
+
+In `run_one_session` (`main.rs:616`), destructure instead of binding the peer:
+
+```rust
+    let rtc::BuiltPeer { peer, abr_target } = rtc::build_peer(
+        pushed_ice,
+        &cfg.stun,
+        handler,
+        false,
+        mode == SessionMode::Desktop,
+    )
+    .await?;
+```
+
+and pass `abr_target` into the Desktop arm's `run_desktop_session(...)` call, beside `connected_rx`.
+
+In `refuse_second_offer` (`main.rs:1256`):
+
+```rust
+    let rtc::BuiltPeer { peer, .. } =
+        rtc::build_peer(pushed_ice, &cfg.stun, Arc::new(rtc::NoopHandler), false, false).await?;
+```
+
+- [ ] **Step 4: Add the pure auto-ABR decision to `desktop.rs`**
+
+```rust
+/// The auto-ABR decision (spec §3.3): clamp GCC's estimate and apply a 15%
+/// dead-band so the encoder is not retargeted on every wobble. `None` means
+/// "leave the encoder alone".
+///
+/// The estimate is ignored until it has **moved off** `ABR_INITIAL_BPS`, so a
+/// path that has not yet reported anything keeps the session profile's target
+/// rather than snapping to the seed (spec §2.3 step 2).
+pub fn abr_next_target(estimate_bps: f64, current_bps: u32) -> Option<u32> {
+    if !estimate_bps.is_finite() || estimate_bps <= 0.0 {
+        return None;
+    }
+    let seed = crate::rtc::ABR_INITIAL_BPS;
+    if (estimate_bps - seed).abs() < seed * 0.05 {
+        return None;
+    }
+    let target = estimate_bps
+        .round()
+        .clamp(MIN_BITRATE_BPS as f64, MAX_BITRATE_BPS as f64) as u32;
+    let delta = (target as i64 - current_bps as i64).unsigned_abs();
+    if delta * 100 < current_bps as u64 * 15 {
+        return None;
+    }
+    Some(target)
+}
+```
+
+- [ ] **Step 5: Thread the handle in and run the auto-ABR task**
+
+Give **both** `run_desktop_session` twins a new trailing parameter `abr_target: Option<Arc<std::sync::atomic::AtomicU64>>` — the same type in both, because the `SessionMode::Desktop` arm in `run_one_session` is shared code that calls whichever twin the target compiles, and a shared call site cannot pass two different types. The musl twin names it `_abr_target` and ignores it (that build never has an estimator). Note the type is written **fully qualified** in both signatures: `AtomicU64` is never named bare in `main.rs`, so it must not be imported. Add to `main.rs`'s imports only what the non-musl body names, **gated** so the musl leg does not see unused imports:
+
+```rust
+#[cfg(not(target_env = "musl"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+```
+
+and pass `abr_target` in from the Desktop arm's `run_desktop_session(...)` call in `run_one_session`, beside `connected_rx`.
+
+> **Auto-ABR is its own task, not a branch in the dispatcher.** Task 4a's dispatcher loop is a `while let Some(event) = dc.poll().await` inside the spawned `control_task`; `control_rx` is owned by `run_stream`. So the auto-ABR loop cannot live in that loop without either (a) racing `dc.poll()` in a `select!`, which would drop a control frame if `poll()` is not cancel-safe, or (b) sharing `control_rx`. A dedicated task that only *sends* into a `control_tx` clone keeps Task 4a's poll loop byte-for-byte and needs no cancel-safety argument.
+
+Spawn it in the **non-musl** `run_desktop_session`. The parameter is an `Option`, and a desktop session always has `Some` (the peer was built with `has_control`); the `None` arm simply skips the spawn and the stream runs at the profile target, so the function stays total without an `unwrap`.
+
+> **Ordering matters: the `control_tx` clone must be taken *before* Task 4a's `control_task`.** That closure is `async move` and consumes `control_tx`, so a `control_tx.clone()` written after the spawn will not compile. Build `manual` and the ABR sender first, then `control_task`, then the ABR task:
+
+```rust
+    // Auto-ABR (spec §3.3, ADR-23 PASS branch): sample GCC's published target
+    // twice a second and feed it into the same `SetBitrate` path manual control
+    // uses, so both share one encoder-retarget code path. A manual
+    // `desktop-bitrate` frame latches `manual` and stops auto for the rest of
+    // the session, so the two never fight.
+    //
+    // This runs whenever congestion control is installed — i.e. whenever the
+    // desktop peer was built with a control channel (`has_control`), including a
+    // session where the viewer never opens the picker (ADR-22): the channel to
+    // `run_stream` exists regardless, so the estimate still reaches the encoder.
+    //
+    // `manual` is created unconditionally: the decode arm below latches it even
+    // when there is no estimator, which is harmless and keeps the arm simple.
+    // This block goes *before* the Task 4a `control_task` spawn, which moves
+    // `control_tx`.
+    let manual = Arc::new(AtomicBool::new(false));
+    let manual_for_decode = Arc::clone(&manual);
+    let abr_sender = control_tx.clone();
+    let abr_task = abr_target.map(|abr_target| {
+        let abr_tx = abr_sender;
+        let manual = Arc::clone(&manual);
+        let seed_target = cfg.desktop_profile.bitrate_bps;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // What we last told the encoder, so the dead-band measures against
+            // reality. Starts at the session profile: until GCC moves off its
+            // seed, `abr_next_target` returns `None` and the stream keeps this
+            // target (spec §2.3 step 2).
+            let mut auto_target = seed_target;
+            loop {
+                tick.tick().await;
+                if manual.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let estimate = f64::from_bits(abr_target.load(Ordering::Relaxed));
+                if let Some(bps) = desktop::abr_next_target(estimate, auto_target) {
+                    if abr_tx.send(desktop::StreamControl::SetBitrate(bps)).await.is_err() {
+                        break;
+                    }
+                    auto_target = bps;
+                }
+            }
+        })
+    });
+    // The Task 4a `control_task` spawn goes *after* this block: it consumes the
+    // original `control_tx`, and its decode arm stores `manual_for_decode` (see
+    // the next snippet). Everything else in the function is unchanged.
+```
+
+Latch `manual` in Task 4a Step 9's decode arm (the `Ok(Some(control))` case), so a manual frame stops auto for good:
+
+```rust
+                        Ok(Some(control)) => {
+                            // A manual bitrate frame is the user taking the
+                            // wheel: stop auto-ABR for the rest of the session.
+                            if matches!(control, desktop::StreamControl::SetBitrate(_)) {
+                                manual_for_decode.store(true, Ordering::Relaxed);
+                            }
+                            if control_tx.send(control).await.is_err() {
+                                break;
+                            }
+                        }
+```
+
+Add the auto-ABR task to teardown beside `control_task` — abort it after `stop_tx.send(true)`, guarding the `Option`:
+
+```rust
+    control_task.abort();
+    if let Some(task) = abr_task {
+        task.abort();
+    }
+```
+
+- [ ] **Step 6: Write the tests**
+
+In `apps/agent/src/desktop.rs` (`mod tests`):
+
+```rust
+    #[test]
+    fn abr_next_target_ignores_the_unmoved_seed() {
+        // GCC's published value equals the seed until feedback arrives: the
+        // stream must keep the session profile's target (spec §2.3 step 2).
+        assert_eq!(abr_next_target(crate::rtc::ABR_INITIAL_BPS, 6_000_000), None);
+    }
+
+    #[test]
+    fn abr_next_target_applies_a_dead_band() {
+        // A 10% move is inside the 15% dead-band and must not retarget.
+        assert_eq!(abr_next_target(4_400_000.0, 4_000_000), None);
+        // A 50% move is outside it.
+        assert_eq!(abr_next_target(6_000_000.0, 4_000_000), Some(6_000_000));
+    }
+
+    #[test]
+    fn abr_next_target_clamps_and_rejects_garbage() {
+        assert_eq!(abr_next_target(0.0, 4_000_000), None);
+        assert_eq!(abr_next_target(f64::NAN, 4_000_000), None);
+        assert_eq!(abr_next_target(1.0e12, 4_000_000), Some(MAX_BITRATE_BPS));
+        assert_eq!(abr_next_target(1.0, 4_000_000), Some(MIN_BITRATE_BPS));
+    }
+```
+
+In `apps/agent/src/rtc.rs`, add this test **inside the existing `#[cfg(test)] mod tests`**, carrying its own non-musl gate on the function (the module itself is ungated, but `abr` does not exist on musl):
+
+```rust
+    #[cfg(not(target_env = "musl"))]
+    #[test]
+    fn reporting_estimator_publishes_its_initial_target() {
+        let (_estimator, handle) = abr::estimator();
+        let published = f64::from_bits(handle.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(published, ABR_INITIAL_BPS);
+    }
+```
+
+- [ ] **Step 7: Run the agent tests, fmt, and clippy**
+
+Run:
+```bash
+cargo test --manifest-path apps/agent/Cargo.toml --locked
+cargo fmt --manifest-path apps/agent/Cargo.toml --check
+cargo clippy --manifest-path apps/agent/Cargo.toml --all-targets --locked -- -D warnings
+```
+Expected: PASS — the 4 new tests plus everything before. If the musl leg (`cargo build --target x86_64-unknown-linux-musl`) reports the `abr` module or `ABR_*` consts unused, check the `#[cfg]` split on the `build_peer` registry block rather than deleting the wiring.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add apps/agent/src/rtc.rs apps/agent/src/desktop.rs apps/agent/src/main.rs
+git commit -m "feat(agent): wire GCC auto-ABR into the in-place retarget path"
+```
+
+---
+
 ### Task 5: Web — store control wiring and `DesktopView` chrome (D4)
 
 **Files:**
@@ -3478,7 +3879,7 @@ git commit -m "feat(web): desktop source picker, bitrate control, and stats line
 - Test: `packages/webrtc-core/test/e2e/desktop.e2e.test.ts` (run by `pnpm --filter @ponter/webrtc-core test:e2e`)
 
 **Interfaces:**
-- Consumes (from Tasks 1–5): the `'control'` label; `desktop-sources`/`desktop-bitrate`/`desktop-select`/`desktop-stats` frames (Task 1 types, Task 4a–4d agent); the agent CLI `--desktop-source test`; the `desktop session loop finished` log line (Task 4a); `DesktopSourceInfo`/`DesktopStats` from `@ponter/shared`.
+- Consumes (from Tasks 1–5): the `'control'` label; `desktop-sources`/`desktop-bitrate`/`desktop-select`/`desktop-stats` frames (Task 1 types, Task 4a–4e agent); the agent CLI `--desktop-source test`; the `desktop session loop finished` log line (Task 4a); `DesktopSourceInfo`/`DesktopStats` from `@ponter/shared`.
 - Produces: nothing later code depends on — this is the last code task. (Task 7 is docs only.)
 
 > **The opener gains the control channel, and that changes *why* teardown works.** Week 7's `openDesktopPeer` used `channelLabels: []` because a desktop session had no data channel; the peer-close test then relied on ICE silence (the shortened media-only timeouts, ~8s). Week 8's desktop peer carries the `'control'` channel, so `build_peer` now gives it the RFC-shaped ICE defaults (Task 4a) and the close signal is the **channel** close — the terminal path's signal, and a prompt one. So the opener moves to `channelLabels: ['control']` and the three Week 7 *assertions* stay byte-for-byte; only the comment explaining the close signal changes. This is the "extended, not replaced" regression guard spec §8.3 asks for.
