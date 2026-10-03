@@ -4407,7 +4407,7 @@ Expected: all PASS. This is the local mirror of the current CI gates — `CI (No
 
 - [x] **Step 6: Record the manual Chrome demo**
 
-> No recording artifact exists (2026-10-03); the demo doc carries the status and the automated real-screen evidence — see `docs/superpowers/specs/2026-10-03-phase3-week8-demo.md`.
+> Manual rows **not gated** — owner decision (2026-10-03); no recording artifact exists. The demo doc reports the automated real-screen evidence and marks the manual rows not observed — see `docs/superpowers/specs/2026-10-03-phase3-week8-demo.md`.
 
 Follow spec §8.4. The recording is saved **outside the repo** (it is a large binary and is not committed). Write its location and the observed results into `docs/superpowers/specs/2026-10-03-phase3-week8-demo.md`:
 
