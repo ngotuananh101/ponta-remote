@@ -381,6 +381,28 @@ describe('DesktopView', () => {
     expect(sendInput).not.toHaveBeenCalled();
   });
 
+  it('focuses the video when input is enabled so keys reach it', async () => {
+    // Keydown fires on the focused element; a video with a tabindex is still
+    // not focused by default, so enabling input must move focus there (spec
+    // §7.2) — otherwise typing lands on nothing until the user clicks first.
+    const wrapper = mount(DesktopView, {
+      props: {
+        tab: desktopTab({
+          desktopSources: twoSources,
+          desktopSourceId: 'monitor:1',
+          desktopInputEnabled: true,
+        }),
+      },
+      // Attached to the document: `focus()` on a detached element does not
+      // move `document.activeElement`, so an unattached mount cannot prove it.
+      attachTo: document.body,
+    });
+    await wrapper.find('[data-test="desktop-input-toggle"]').setValue(true);
+
+    expect(document.activeElement).toBe(wrapper.find('video').element);
+    wrapper.unmount();
+  });
+
   it('still renders the <video> with no controls when input is enabled', () => {
     const wrapper = mountWithChrome({ desktopInputEnabled: true });
     expect(wrapper.find('video').attributes('controls')).toBeUndefined();

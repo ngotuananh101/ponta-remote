@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue';
+import {
+  ref,
+  watch,
+  computed,
+  nextTick,
+  onMounted,
+  onBeforeUnmount,
+} from 'vue';
 import { RefreshCw } from '@lucide/vue';
 import { Button } from '@/components/ui/button';
 import ConnectionProgress from '@/components/terminal/ConnectionProgress.vue';
@@ -80,6 +87,19 @@ watch(
     if (!enabled) inputOn.value = false;
   },
 );
+// Keydown only reaches the focused element, and a `tabindex` does not focus
+// itself: moving focus to the video on enable is what makes typing land on the
+// remote desktop without a click first (spec §7.2).
+watch(inputOn, async (on) => {
+  if (!on) return;
+  await nextTick();
+  videoEl.value?.focus();
+});
+
+/** The input toggle is our own chrome, so its state is the local `inputOn`. */
+function onToggle(event: Event): void {
+  inputOn.value = (event.target as HTMLInputElement).checked;
+}
 
 function modifiersOf(e: KeyboardEvent | MouseEvent): KeyModifiers {
   return { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey };
@@ -222,7 +242,7 @@ const inputHandlers = computed(() => {
           data-test="desktop-input-toggle"
           type="checkbox"
           :checked="inputOn"
-          @change="inputOn = ($event.target as HTMLInputElement).checked"
+          @change="onToggle"
         />
         <span>Input</span>
       </label>
