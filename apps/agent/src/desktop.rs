@@ -1269,6 +1269,31 @@ pub fn clamp_bitrate(bps: u32) -> u32 {
     bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
 }
 
+/// The auto-ABR decision (spec §3.3): clamp GCC's estimate and apply a 15%
+/// dead-band so the encoder is not retargeted on every wobble. `None` means
+/// "leave the encoder alone".
+///
+/// The estimate is ignored until it has **moved off** `ABR_INITIAL_BPS`, so a
+/// path that has not yet reported anything keeps the session profile's target
+/// rather than snapping to the seed (spec §2.3 step 2).
+pub fn abr_next_target(estimate_bps: f64, current_bps: u32) -> Option<u32> {
+    if !estimate_bps.is_finite() || estimate_bps <= 0.0 {
+        return None;
+    }
+    let seed = crate::rtc::ABR_INITIAL_BPS;
+    if (estimate_bps - seed).abs() < seed * 0.05 {
+        return None;
+    }
+    let target = estimate_bps
+        .round()
+        .clamp(MIN_BITRATE_BPS as f64, MAX_BITRATE_BPS as f64) as u32;
+    let delta = (target as i64 - current_bps as i64).unsigned_abs();
+    if delta * 100 < current_bps as u64 * 15 {
+        return None;
+    }
+    Some(target)
+}
+
 /// The `desktop-bitrate` payload (spec §2.2).
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2417,5 +2442,31 @@ mod tests {
         for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK * 2 {
             assert_eq!(at_floor.observe(slow), SustainAction::Continue);
         }
+    }
+
+    #[test]
+    fn abr_next_target_ignores_the_unmoved_seed() {
+        // GCC's published value equals the seed until feedback arrives: the
+        // stream must keep the session profile's target (spec §2.3 step 2).
+        assert_eq!(
+            abr_next_target(crate::rtc::ABR_INITIAL_BPS, 6_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn abr_next_target_applies_a_dead_band() {
+        // A 10% move is inside the 15% dead-band and must not retarget.
+        assert_eq!(abr_next_target(4_400_000.0, 4_000_000), None);
+        // A 50% move is outside it.
+        assert_eq!(abr_next_target(6_000_000.0, 4_000_000), Some(6_000_000));
+    }
+
+    #[test]
+    fn abr_next_target_clamps_and_rejects_garbage() {
+        assert_eq!(abr_next_target(0.0, 4_000_000), None);
+        assert_eq!(abr_next_target(f64::NAN, 4_000_000), None);
+        assert_eq!(abr_next_target(1.0e12, 4_000_000), Some(MAX_BITRATE_BPS));
+        assert_eq!(abr_next_target(1.0, 4_000_000), Some(MIN_BITRATE_BPS));
     }
 }

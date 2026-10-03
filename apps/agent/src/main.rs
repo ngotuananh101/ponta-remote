@@ -17,6 +17,8 @@ mod signal;
 use std::collections::HashMap;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_env = "musl"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -715,7 +717,7 @@ async fn run_one_session(
     ));
     // A desktop peer now carries a control channel, so it keeps the RFC-shaped
     // ICE defaults; `media_only` is false for every Week 8 session.
-    let peer = rtc::build_peer(
+    let rtc::BuiltPeer { peer, abr_target } = rtc::build_peer(
         pushed_ice,
         &cfg.stun,
         handler,
@@ -746,6 +748,7 @@ async fn run_one_session(
                 channel.clone(),
                 open_rx,
                 inbound,
+                abr_target,
             )
             .await;
         }
@@ -1109,6 +1112,7 @@ async fn run_desktop_session(
     channel: Arc<OnceLock<Arc<dyn DataChannel>>>,
     mut open_rx: tokio::sync::oneshot::Receiver<()>,
     inbound: &mut mpsc::Receiver<signal::SignalMessage>,
+    abr_target: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<()> {
     // Create the source first so a capture failure is a clean refusal
     // (`approved: false`) instead of a session the browser opens onto a black
@@ -1237,6 +1241,56 @@ async fn run_desktop_session(
     }
     let sources_frame = desktop::frame_desktop_sources(&sources, crate::pty::now_ms());
 
+    // Auto-ABR (spec §3.3, ADR-23 PASS branch): sample GCC's published target
+    // twice a second and feed it into the same `SetBitrate` path manual control
+    // uses, so both share one encoder-retarget code path. A manual
+    // `desktop-bitrate` frame latches `manual` and stops auto for the rest of
+    // the session, so the two never fight.
+    //
+    // This runs whenever congestion control is installed — i.e. whenever the
+    // desktop peer was built with a control channel (`has_control`), including a
+    // session where the viewer never opens the picker (ADR-22): the channel to
+    // `run_stream` exists regardless, so the estimate still reaches the encoder.
+    //
+    // `manual` is created unconditionally: the decode arm below latches it even
+    // when there is no estimator, which is harmless and keeps the arm simple.
+    // This block goes *before* the `control_task` spawn, which moves
+    // `control_tx`.
+    let manual = Arc::new(AtomicBool::new(false));
+    let manual_for_decode = Arc::clone(&manual);
+    let abr_sender = control_tx.clone();
+    let abr_task = abr_target.map(|abr_target| {
+        let abr_tx = abr_sender;
+        let manual = Arc::clone(&manual);
+        let seed_target = cfg.desktop_profile.bitrate_bps;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // What we last told the encoder, so the dead-band measures against
+            // reality. Starts at the session profile: until GCC moves off its
+            // seed, `abr_next_target` returns `None` and the stream keeps this
+            // target (spec §2.3 step 2).
+            let mut auto_target = seed_target;
+            loop {
+                tick.tick().await;
+                if manual.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let estimate = f64::from_bits(abr_target.load(Ordering::Relaxed));
+                if let Some(bps) = desktop::abr_next_target(estimate, auto_target) {
+                    if abr_tx
+                        .send(desktop::StreamControl::SetBitrate(bps))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    auto_target = bps;
+                }
+            }
+        })
+    });
+
     let channel_for_control = channel.clone();
     let end_tx_for_control = end_tx.clone();
     let session_id = offer.session_id.clone();
@@ -1269,6 +1323,11 @@ async fn run_desktop_session(
                         };
                         match desktop::decode_control(text) {
                             Ok(Some(control)) => {
+                                // A manual bitrate frame is the user taking the
+                                // wheel: stop auto-ABR for the rest of the session.
+                                if matches!(control, desktop::StreamControl::SetBitrate(_)) {
+                                    manual_for_decode.store(true, Ordering::Relaxed);
+                                }
                                 if control_tx.send(control).await.is_err() {
                                     break;
                                 }
@@ -1374,6 +1433,11 @@ async fn run_desktop_session(
     // The control dispatcher parks on the data channel's `poll()`, which only
     // ends when the channel closes; abort it so it cannot outlive the session.
     control_task.abort();
+    // The auto-ABR sampler only sends into the control channel; abort it beside
+    // the dispatcher so neither outlives the session.
+    if let Some(task) = abr_task {
+        task.abort();
+    }
     let _ = peer.close().await;
     Ok(())
 }
@@ -1395,6 +1459,7 @@ async fn run_desktop_session(
     _channel: Arc<OnceLock<Arc<dyn DataChannel>>>,
     _open_rx: tokio::sync::oneshot::Receiver<()>,
     _inbound: &mut mpsc::Receiver<signal::SignalMessage>,
+    _abr_target: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) -> Result<()> {
     tracing::warn!(
         session_id = %offer.session_id,
@@ -1492,7 +1557,7 @@ async fn refuse_second_offer(
     );
     // A peer that will only answer and close still needs a handler — 0.21's
     // `build()` refuses without one — and none of its callbacks matter here.
-    let peer = rtc::build_peer(
+    let rtc::BuiltPeer { peer, .. } = rtc::build_peer(
         pushed_ice,
         &cfg.stun,
         Arc::new(rtc::NoopHandler),
