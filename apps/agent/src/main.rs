@@ -686,16 +686,33 @@ async fn run_one_session(
     let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
     let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
+    // The one channel label this session accepts. A terminal session accepts
+    // `terminal`; a desktop session accepts `control` (spec §2.1). The `None`
+    // mode never opens a session, so its label is never used.
+    let accepted_label = match mode {
+        SessionMode::Desktop => rtc::CONTROL_LABEL.to_string(),
+        _ => rtc::TERMINAL_LABEL.to_string(),
+    };
+
     let handler = Arc::new(rtc::SessionHandler::new(
         offer.session_id.clone(),
         outbound.clone(),
         end_tx.clone(),
+        accepted_label,
         channel.clone(),
         open_tx,
         connected_tx,
     ));
-    let peer =
-        rtc::build_peer(pushed_ice, &cfg.stun, handler, mode == SessionMode::Desktop).await?;
+    // A desktop peer now carries a control channel, so it keeps the RFC-shaped
+    // ICE defaults; `media_only` is false for every Week 8 session.
+    let peer = rtc::build_peer(
+        pushed_ice,
+        &cfg.stun,
+        handler,
+        false,
+        mode == SessionMode::Desktop,
+    )
+    .await?;
 
     // Candidates that arrive before the remote description is set (spec R3).
     let mut pending: Vec<RTCIceCandidateInit> = Vec::new();
@@ -715,6 +732,9 @@ async fn run_one_session(
                 &mut pending,
                 connected_rx,
                 end_rx,
+                end_tx,
+                channel.clone(),
+                open_rx,
                 inbound,
             )
             .await;
@@ -1050,6 +1070,12 @@ async fn run_one_session(
     Ok(())
 }
 
+/// How long the dispatcher waits for the control channel before concluding the
+/// browser never opened one. Streaming is already running by then, so this only
+/// decides whether the picker is offered.
+#[cfg(not(target_env = "musl"))]
+const CONTROL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Serve a desktop offer end to end: create the source, attach the track,
 /// answer, wait for the connection, stream, and tear down.
 ///
@@ -1069,6 +1095,9 @@ async fn run_desktop_session(
     pending: &mut Vec<RTCIceCandidateInit>,
     mut connected_rx: tokio::sync::oneshot::Receiver<()>,
     mut end_rx: mpsc::Receiver<&'static str>,
+    end_tx: mpsc::Sender<&'static str>,
+    channel: Arc<OnceLock<Arc<dyn DataChannel>>>,
+    mut open_rx: tokio::sync::oneshot::Receiver<()>,
     inbound: &mut mpsc::Receiver<signal::SignalMessage>,
 ) -> Result<()> {
     // Create the source first so a capture failure is a clean refusal
@@ -1175,6 +1204,82 @@ async fn run_desktop_session(
 
     let (ssrc, payload_type) = rtc::desktop_stream_params(&media).await?;
 
+    let (control_tx, control_rx) = mpsc::channel::<desktop::StreamControl>(16);
+
+    // The enumeration the picker shows. In test mode it is synthesised (CI is
+    // headless and must not touch xcap); on a real host it is the live
+    // enumeration. The streaming entry is flagged `default: true` so the
+    // browser marks it selected without any interaction (ADR-22).
+    //
+    // `default_id` was resolved above (it built the pre-answer source), so it is
+    // reused here rather than re-derived — the picker's `default` flag and the
+    // live stream must name the same source.
+    let mut sources = match cfg.desktop_source {
+        DesktopSource::Test => vec![desktop::test_source_info()],
+        DesktopSource::Screen => desktop::enumerate_sources().unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "source enumeration failed; the picker will be empty");
+            Vec::new()
+        }),
+    };
+    for source in &mut sources {
+        source.default = source.id == default_id;
+    }
+    let sources_frame = desktop::frame_desktop_sources(&sources, crate::pty::now_ms());
+
+    let channel_for_control = channel.clone();
+    let end_tx_for_control = end_tx.clone();
+    let session_id = offer.session_id.clone();
+    let control_task = tokio::spawn(async move {
+        // The control channel opens after the answer; wait for it, but never
+        // block the stream on it — a viewer that never opens the picker still
+        // gets video (ADR-22).
+        let dc = tokio::select! {
+            result = &mut open_rx => match result {
+                Ok(()) => channel_for_control.get().cloned(),
+                Err(_) => None,
+            },
+            _ = tokio::time::sleep(CONTROL_OPEN_TIMEOUT) => None,
+        };
+        let Some(dc) = dc else {
+            tracing::debug!(session_id = %session_id, "no control channel opened; media-only session");
+            return;
+        };
+        if let Err(e) = dc.send_text(&sources_frame).await {
+            tracing::debug!(error = %e, "sending desktop-sources failed");
+            return;
+        }
+        while let Some(event) = dc.poll().await {
+            match event {
+                DataChannelEvent::OnMessage(message) => {
+                    let Ok(text) = std::str::from_utf8(&message.data) else {
+                        tracing::debug!("ignoring a non-UTF-8 control frame");
+                        continue;
+                    };
+                    match desktop::decode_control(text) {
+                        Ok(Some(control)) => {
+                            if control_tx.send(control).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::debug!(error = %e, "dropping a malformed control frame"),
+                    }
+                }
+                DataChannelEvent::OnClose => break,
+                _ => {}
+            }
+        }
+        // The control channel is this desktop session's only data channel, so
+        // its close is the end-of-session signal — exactly as the terminal
+        // channel's close is (the 2026-10-01 dead-peer fix). Without this the
+        // session loop below would sit on `inbound`/`end_rx` until the 1h cap,
+        // holding the single ADR-14 slot after the browser closed the tab.
+        // Fires on an explicit `OnClose` and on `poll()` returning `None` (the
+        // driver ended the channel) alike. `try_send` on a full channel is a
+        // no-op: the first reason already won.
+        let _ = end_tx_for_control.try_send("the control channel closed");
+    });
+
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut stream = tokio::spawn(desktop::run_stream(
         source,
@@ -1182,6 +1287,7 @@ async fn run_desktop_session(
         ssrc,
         payload_type,
         cfg.desktop_profile,
+        control_rx,
         stop_rx,
     ));
 
@@ -1234,6 +1340,9 @@ async fn run_desktop_session(
         tracing::warn!("the desktop stream did not stop within 5s; aborting it");
         stream.abort();
     }
+    // The control dispatcher parks on the data channel's `poll()`, which only
+    // ends when the channel closes; abort it so it cannot outlive the session.
+    control_task.abort();
     let _ = peer.close().await;
     Ok(())
 }
@@ -1251,6 +1360,9 @@ async fn run_desktop_session(
     _pending: &mut Vec<RTCIceCandidateInit>,
     _connected_rx: tokio::sync::oneshot::Receiver<()>,
     _end_rx: mpsc::Receiver<&'static str>,
+    _end_tx: mpsc::Sender<&'static str>,
+    _channel: Arc<OnceLock<Arc<dyn DataChannel>>>,
+    _open_rx: tokio::sync::oneshot::Receiver<()>,
     _inbound: &mut mpsc::Receiver<signal::SignalMessage>,
 ) -> Result<()> {
     tracing::warn!(
@@ -1349,7 +1461,14 @@ async fn refuse_second_offer(
     );
     // A peer that will only answer and close still needs a handler — 0.21's
     // `build()` refuses without one — and none of its callbacks matter here.
-    let peer = rtc::build_peer(pushed_ice, &cfg.stun, Arc::new(rtc::NoopHandler), false).await?;
+    let peer = rtc::build_peer(
+        pushed_ice,
+        &cfg.stun,
+        Arc::new(rtc::NoopHandler),
+        false,
+        false,
+    )
+    .await?;
     rtc::refuse_offer(&peer, offer, outbound).await?;
     let _ = peer.close().await;
     Ok(())

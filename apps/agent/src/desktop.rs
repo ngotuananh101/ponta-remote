@@ -746,6 +746,7 @@ pub async fn run_stream(
     ssrc: SSRC,
     payload_type: PayloadType,
     profile: StreamProfile,
+    mut control: tokio::sync::mpsc::Receiver<StreamControl>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
     // `changed()` only resolves on the *next* send, so a signal that is
@@ -761,11 +762,27 @@ pub async fn run_stream(
 
     let mut skipped: u64 = 0;
     let mut encoded: u64 = 0;
+    // Set once the control sender is gone, so the `select!` arm is disabled and
+    // the loop cannot spin on a closed channel (a `continue` on `None` would).
+    let mut control_closed = false;
     loop {
         tokio::select! {
             _ = stop.changed() => {
                 if *stop.borrow() {
                     break;
+                }
+            }
+            command = control.recv(), if !control_closed => {
+                match command {
+                    Some(StreamControl::SetBitrate(bps)) => {
+                        // Task 4b implements this arm.
+                        tracing::debug!(bps, "desktop: bitrate command received");
+                    }
+                    Some(StreamControl::SourceSwap(id)) => {
+                        // Task 4c implements this arm.
+                        tracing::debug!(source_id = %id, "desktop: source-swap command received");
+                    }
+                    None => control_closed = true,
                 }
             }
             _ = ticker.tick() => {
@@ -886,6 +903,109 @@ impl DesktopEncoder {
             .map_err(|e| anyhow::anyhow!("H.264 encode failed: {e}"))?;
         Ok(bitstream.to_vec())
     }
+}
+
+/// The bitrate range a `desktop-bitrate` frame is clamped into (spec §9).
+///
+/// A hostile or buggy value must not drive the encoder to a degenerate config
+/// (0 bps stalls the stream; a multi-gigabit target makes openh264 refuse the
+/// retarget). The clamp happens at the wire boundary, in `decode_control`.
+pub const MIN_BITRATE_BPS: u32 = 250_000;
+pub const MAX_BITRATE_BPS: u32 = 20_000_000;
+
+/// A command the control dispatcher forwards into `run_stream` (spec §6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamControl {
+    /// Manual bitrate target, already clamped to `MIN..=MAX_BITRATE_BPS`.
+    SetBitrate(u32),
+    /// Switch to another enumerated source (ADR-22). The id is validated
+    /// against the enumeration inside `run_stream`'s swap path, never here.
+    SourceSwap(String),
+}
+
+/// Clamp a requested bitrate into the sane range (spec §9).
+pub fn clamp_bitrate(bps: u32) -> u32 {
+    bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+}
+
+/// The `desktop-bitrate` payload (spec §2.2).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopBitrateMessage {
+    bitrate_bps: u32,
+}
+
+/// The `desktop-select` payload (spec §2.2).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSelectMessage {
+    source_id: String,
+}
+
+/// Decode one inbound control frame into a `StreamControl`.
+///
+/// Returns `Ok(None)` for a frame on another channel (ADR-09: the agent ignores
+/// any other channel) and for an unknown `type` (forward-compatible, spec §2.2);
+/// returns `Err` only for a frame that claims to be `control` but is malformed.
+/// Mirrors `pty::decode_pty_input`'s shape.
+pub fn decode_control(raw: &str) -> Result<Option<StreamControl>> {
+    let envelope: crate::pty::DataChannelMessage<serde_json::Value> =
+        serde_json::from_str(raw).context("inbound frame is not a DataChannelMessage")?;
+
+    if envelope.channel != "control" {
+        return Ok(None);
+    }
+
+    match envelope.r#type.as_str() {
+        "desktop-select" => {
+            let message: DesktopSelectMessage = serde_json::from_value(envelope.payload)
+                .context("payload is not a DesktopSelectMessage")?;
+            Ok(Some(StreamControl::SourceSwap(message.source_id)))
+        }
+        "desktop-bitrate" => {
+            let message: DesktopBitrateMessage = serde_json::from_value(envelope.payload)
+                .context("payload is not a DesktopBitrateMessage")?;
+            Ok(Some(StreamControl::SetBitrate(clamp_bitrate(
+                message.bitrate_bps,
+            ))))
+        }
+        // An unknown control type is dropped, never answered (spec §2.2).
+        _ => Ok(None),
+    }
+}
+
+/// The single synthetic entry `--desktop-source test` enumerates (spec §2.3).
+///
+/// CI is headless, so the test path must not touch `xcap` enumeration at all:
+/// it reports exactly one source, flagged `default: true`, so the browser
+/// auto-selects it and E2E never blocks on a picker.
+pub fn test_source_info() -> DesktopSourceInfo {
+    DesktopSourceInfo {
+        id: "test:0".to_string(),
+        kind: SourceKind::Monitor,
+        name: "Test pattern".to_string(),
+        width: 1280,
+        height: 720,
+        x: 0,
+        y: 0,
+        scale_factor: 1.0,
+        rotation: 0.0,
+        is_primary: true,
+        default: true,
+    }
+}
+
+/// Frame the enumeration as a `desktop-sources` control message (spec §2.2).
+///
+/// Pure so the wire shape is unit-testable without a peer connection.
+pub fn frame_desktop_sources(sources: &[DesktopSourceInfo], timestamp_ms: i64) -> String {
+    let message = crate::pty::DataChannelMessage {
+        r#type: "desktop-sources".to_string(),
+        channel: "control".to_string(),
+        payload: serde_json::json!({ "sources": sources }),
+        timestamp: timestamp_ms,
+    };
+    serde_json::to_string(&message).expect("a frame of plain data cannot fail to serialize")
 }
 
 #[cfg(test)]
@@ -1290,6 +1410,7 @@ mod tests {
         // of spinning, so the session loop can tear down.
         let (stop_tx, stop_rx) = watch::channel(false);
         let source = Box::new(TestPatternSource::new(64, 48));
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel::<StreamControl>(1);
 
         let result = run_stream(
             source,
@@ -1297,6 +1418,7 @@ mod tests {
             1234,
             96,
             StreamProfile::SAFE_720P30,
+            control_rx,
             stop_rx,
         )
         .await;
@@ -1317,6 +1439,7 @@ mod tests {
         // this test pins that check.
         let (stop_tx, stop_rx) = watch::channel(true);
         let source = Box::new(TestPatternSource::new(64, 48));
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel::<StreamControl>(1);
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -1326,6 +1449,7 @@ mod tests {
                 1234,
                 96,
                 StreamProfile::SAFE_720P30,
+                control_rx,
                 stop_rx,
             ),
         )
@@ -1464,5 +1588,92 @@ mod tests {
             idrs_after_first, 0,
             "ScreenContentRealTime emitted {idrs_after_first} IDR(s) after frame 0"
         );
+    }
+
+    #[test]
+    fn decode_control_reads_a_desktop_select() {
+        let raw = serde_json::json!({
+            "type": "desktop-select",
+            "channel": "control",
+            "payload": { "sourceId": "window:0x4a00007" },
+            "timestamp": 1,
+        })
+        .to_string();
+        assert_eq!(
+            decode_control(&raw).unwrap(),
+            Some(StreamControl::SourceSwap("window:0x4a00007".to_string()))
+        );
+    }
+
+    #[test]
+    fn decode_control_reads_and_clamps_a_desktop_bitrate() {
+        let frame = |bps: u32| {
+            serde_json::json!({
+                "type": "desktop-bitrate",
+                "channel": "control",
+                "payload": { "bitrateBps": bps },
+                "timestamp": 1,
+            })
+            .to_string()
+        };
+        assert_eq!(
+            decode_control(&frame(3_000_000)).unwrap(),
+            Some(StreamControl::SetBitrate(3_000_000))
+        );
+        assert_eq!(
+            decode_control(&frame(1)).unwrap(),
+            Some(StreamControl::SetBitrate(MIN_BITRATE_BPS))
+        );
+        assert_eq!(
+            decode_control(&frame(u32::MAX)).unwrap(),
+            Some(StreamControl::SetBitrate(MAX_BITRATE_BPS))
+        );
+    }
+
+    #[test]
+    fn decode_control_ignores_another_channel_and_an_unknown_type() {
+        let wrong_channel = serde_json::json!({
+            "type": "desktop-select",
+            "channel": "terminal",
+            "payload": { "sourceId": "monitor:1" },
+            "timestamp": 1,
+        })
+        .to_string();
+        assert_eq!(decode_control(&wrong_channel).unwrap(), None);
+
+        let unknown = serde_json::json!({
+            "type": "desktop-future",
+            "channel": "control",
+            "payload": {},
+            "timestamp": 1,
+        })
+        .to_string();
+        assert_eq!(decode_control(&unknown).unwrap(), None);
+    }
+
+    #[test]
+    fn decode_control_rejects_a_malformed_select_payload() {
+        let raw = serde_json::json!({
+            "type": "desktop-select",
+            "channel": "control",
+            "payload": { "sourceId": 42 },
+            "timestamp": 1,
+        })
+        .to_string();
+        assert!(decode_control(&raw).is_err());
+    }
+
+    #[test]
+    fn frame_desktop_sources_carries_the_envelope_and_the_default_flag() {
+        let raw = frame_desktop_sources(&[test_source_info()], 7);
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["type"], "desktop-sources");
+        assert_eq!(value["channel"], "control");
+        assert_eq!(value["timestamp"], 7);
+        assert_eq!(value["payload"]["sources"][0]["id"], "test:0");
+        assert_eq!(value["payload"]["sources"][0]["default"], true);
+        // The camelCase wire spelling, not the Rust field name.
+        assert!(value["payload"]["sources"][0].get("scaleFactor").is_some());
+        assert!(value["payload"]["sources"][0].get("scale_factor").is_none());
     }
 }

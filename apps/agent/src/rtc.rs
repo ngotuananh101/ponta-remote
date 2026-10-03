@@ -52,6 +52,9 @@ use crate::signal::{IceCandidateSignal, IceServerEntry, SignalAnswer, SignalMess
 /// The one channel label this agent accepts. ADR-09: exact label, nothing else.
 pub const TERMINAL_LABEL: &str = "terminal";
 
+/// The desktop control channel's label (Week 8, spec §2.1). Desktop-only.
+pub const CONTROL_LABEL: &str = "control";
+
 /// The capability string that selects a desktop session (ADR-15).
 pub const DESKTOP_LABEL: &str = "desktop";
 
@@ -284,6 +287,7 @@ pub async fn build_peer(
     stun_url: &str,
     handler: Arc<dyn PeerConnectionEventHandler>,
     media_only: bool,
+    has_control: bool,
 ) -> Result<Arc<dyn PeerConnection>> {
     let mut media = MediaEngine::default();
     media
@@ -316,19 +320,24 @@ pub async fn build_peer(
         // while this side answers.
         .with_answering_dtls_role(RTCDtlsRole::Server);
 
-    // A media-only (desktop) peer has no data channel, so ICE silence is its
-    // only "the browser is gone" signal: werift's `pc.close()` on a connection
-    // with no SCTP association sends neither a DTLS close_notify nor an ICE
-    // packet, it simply stops. The defaults (disconnected 5s + failed 25s, per
-    // `rtc-ice`'s `validate_selected_pair`) would hold the ADR-14 slot for ~30s
-    // after a network drop — long enough that a user cannot reconnect, and long
-    // enough that the E2E teardown assertion (20s) could never pass. Desktop
-    // media flows every ~66ms, so 3s of silence is unambiguous; Failed at
+    // A peer with a data channel — terminal's, or desktop's control channel —
+    // treats a channel close as the end-of-session signal, so it keeps the
+    // RFC-shaped ICE defaults. Only a peer with no channel at all relies on ICE
+    // silence, and only that peer gets the shortened timeouts (spec §6.3).
+    //
+    // Week 7's rationale for the shortened timeouts still holds for that
+    // no-channel case: werift's `pc.close()` on a connection with no SCTP
+    // association sends neither a DTLS close_notify nor an ICE packet, it simply
+    // stops. The defaults (disconnected 5s + failed 25s, per `rtc-ice`'s
+    // `validate_selected_pair`) would hold the ADR-14 slot for ~30s after a
+    // network drop — long enough that a user cannot reconnect, and long enough
+    // that the E2E teardown assertion (20s) could never pass. Desktop media
+    // flows every ~66ms, so 3s of silence is unambiguous; Failed at
     // 3s + 5s = 8s keeps a brief `Disconnected` recoverable while still freeing
-    // the slot promptly. Terminal peers keep the RFC-shaped defaults — their
-    // data channel is the close signal, so a short ICE timeout would only add
-    // false failures on a healthy-but-quiet link.
-    if media_only {
+    // the slot promptly. A peer with a channel does not need this: its channel
+    // close is the prompt signal, so a short ICE timeout would only add false
+    // failures on a healthy-but-quiet link.
+    if media_only && !has_control {
         setting = setting.with_ice_timeouts(
             Some(Duration::from_secs(3)),
             Some(Duration::from_secs(5)),
@@ -373,6 +382,9 @@ pub struct SessionHandler {
     session_id: String,
     outbound: mpsc::Sender<SignalMessage>,
     end_tx: mpsc::Sender<&'static str>,
+    /// The one channel label this session accepts (ADR-09): `terminal` for a
+    /// terminal session, `control` for a desktop session.
+    accepted_label: String,
     channel: Arc<OnceLock<Arc<dyn DataChannel>>>,
     open_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     /// Fired once on `Connected`. The desktop session waits on it; the terminal
@@ -385,6 +397,7 @@ impl SessionHandler {
         session_id: String,
         outbound: mpsc::Sender<SignalMessage>,
         end_tx: mpsc::Sender<&'static str>,
+        accepted_label: String,
         channel: Arc<OnceLock<Arc<dyn DataChannel>>>,
         open_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
         connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -393,6 +406,7 @@ impl SessionHandler {
             session_id,
             outbound,
             end_tx,
+            accepted_label,
             channel,
             open_tx,
             connected_tx,
@@ -491,7 +505,7 @@ impl PeerConnectionEventHandler for SessionHandler {
     /// back-pressure), not lost.
     async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
         match dc.label().await {
-            Ok(label) if label == TERMINAL_LABEL => {}
+            Ok(label) if label == self.accepted_label => {}
             Ok(label) => {
                 tracing::warn!(label = %label, "refusing unexpected channel");
                 let _ = dc.close().await;
@@ -506,7 +520,7 @@ impl PeerConnectionEventHandler for SessionHandler {
         }
 
         if let Err(second) = self.channel.set(dc) {
-            tracing::warn!("refusing a second terminal channel");
+            tracing::warn!(label = %self.accepted_label, "refusing a second session channel");
             let _ = second.close().await;
             return;
         }
