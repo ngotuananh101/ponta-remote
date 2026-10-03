@@ -836,6 +836,79 @@ async fn swap_source<S: SwapSource>(
     Ok(encoder)
 }
 
+/// How many consecutive over-budget frames before the agent falls back to
+/// 720p30. 30 frames is ~1 s at 30 fps — long enough to ride out a transient
+/// stall (a GC pause, a scheduler hiccup), short enough that a host which truly
+/// cannot sustain 1080p30 drops within a second (ADR-24).
+pub const SUSTAIN_FRAMES_BEFORE_FALLBACK: u32 = 30;
+
+/// What the sustain check wants to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SustainAction {
+    /// Stay on the current profile.
+    Continue,
+    /// Rebuild at `SAFE_720P30` — a resolution change, so an encoder rebuild.
+    Downgrade,
+}
+
+/// The ADR-24 fallback decision, as a pure state machine.
+///
+/// `run_stream` feeds it one `Duration` per encoded frame; the test feeds it
+/// synthetic durations. Keeping the decision out of the encode loop is what
+/// makes "downgrade once, never oscillate" unit-testable without a real encoder
+/// or a slow host.
+pub struct SustainMonitor {
+    /// The per-frame budget of the profile currently being encoded.
+    budget: Duration,
+    /// Consecutive over-budget frames seen so far.
+    consecutive_over: u32,
+    /// Set once a downgrade is requested (or immediately, at the floor) so the
+    /// monitor can never ask twice — ADR-24's anti-oscillation hysteresis.
+    latched: bool,
+}
+
+impl SustainMonitor {
+    pub fn new(profile: StreamProfile) -> Self {
+        Self {
+            budget: profile.frame_budget(),
+            // At the floor there is nowhere to fall back to, so the latch starts
+            // closed and `observe` can never return `Downgrade`.
+            latched: profile == StreamProfile::SAFE_720P30,
+            consecutive_over: 0,
+        }
+    }
+
+    /// One encoded frame took `encode_time`; decide whether to keep going.
+    pub fn observe(&mut self, encode_time: Duration) -> SustainAction {
+        if self.latched {
+            return SustainAction::Continue;
+        }
+        if encode_time > self.budget {
+            self.consecutive_over += 1;
+        } else {
+            // A single on-budget frame proves the stall was transient; the
+            // streak resets so a jittery-but-sustainable host is never demoted.
+            self.consecutive_over = 0;
+        }
+        if self.consecutive_over >= SUSTAIN_FRAMES_BEFORE_FALLBACK {
+            self.latched = true;
+            return SustainAction::Downgrade;
+        }
+        SustainAction::Continue
+    }
+
+    /// A manual bitrate change is the user asking for a fresh evaluation, so the
+    /// latch re-opens — but only while there is a lower rung to fall to. At the
+    /// floor, re-opening would only re-select the same profile, so it stays
+    /// closed (ADR-24's "no oscillation").
+    pub fn note_manual_bitrate(&mut self, current: StreamProfile) {
+        if current != StreamProfile::SAFE_720P30 {
+            self.latched = false;
+            self.consecutive_over = 0;
+        }
+    }
+}
+
 /// Encodes frames as they arrive and writes each as one media sample.
 ///
 /// Runs until `stop` flips to `true` (checked before the first tick and after
@@ -872,6 +945,7 @@ pub async fn run_stream(
     }
 
     let mut encoder = DesktopEncoder::new(profile)?;
+    let mut sustain = SustainMonitor::new(profile);
     let mut ticker = tokio::time::interval(profile.frame_budget());
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -910,6 +984,9 @@ pub async fn run_stream(
                         match encoder.apply_bitrate(bps) {
                             Ok(()) => {
                                 profile.bitrate_bps = bps;
+                                // A manual change is a fresh evaluation request
+                                // (re-arms only above the floor; ADR-24).
+                                sustain.note_manual_bitrate(profile);
                                 // Reflect the effective value to the UI (spec §2.3 step 6).
                                 send_stats(&events, encoded_size, profile, None);
                             }
@@ -963,7 +1040,36 @@ pub async fn run_stream(
                     continue;
                 };
                 let frame = crop_to_even(downscale(&frame, profile.max_width, profile.max_height));
+                let encode_start = Instant::now();
                 let data = encoder.encode(&frame)?;
+                let encode_time = encode_start.elapsed();
+
+                if sustain.observe(encode_time) == SustainAction::Downgrade {
+                    // ADR-24: the host cannot sustain the current profile's
+                    // budget, so drop to the guaranteed floor. One rebuild, one
+                    // IDR blip, and the monitor's latch is closed by construction
+                    // (`SustainMonitor::new(SAFE_720P30)` starts latched).
+                    tracing::warn!(
+                        from = ?(profile.max_width, profile.max_height),
+                        encode_ms = encode_time.as_secs_f64() * 1000.0,
+                        "desktop: cannot sustain the profile; falling back to 720p30"
+                    );
+                    profile = StreamProfile::SAFE_720P30;
+                    encoder = DesktopEncoder::new(profile)?;
+                    sustain = SustainMonitor::new(profile);
+                    encoded_size = (profile.max_width, profile.max_height);
+                    // The stats' width/height already reflect the new size (§6.4).
+                    send_stats(
+                        &events,
+                        encoded_size,
+                        profile,
+                        Some(StatsStatus {
+                            kind: StatsStatusKind::QualityDowngraded,
+                            detail: "720p30 (quality downgraded)".to_string(),
+                        }),
+                    );
+                }
+
                 encoded += 1;
                 encoded_size = (frame.width, frame.height);
                 // The UI gets one stats frame as soon as the stream is live
@@ -1264,12 +1370,6 @@ pub struct StatsStatus {
 
 /// The two note kinds on the wire (spec §2.2). `kebab-case` matches the
 /// TypeScript union exactly.
-///
-/// `SelectRefused` is constructed by Task 4c (the source-swap refusal path) and
-/// `QualityDowngraded` by Task 4d (the sustain fallback), so until those land
-/// neither variant has a producer — the wire contract must exist first, hence
-/// the allow.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StatsStatusKind {
@@ -2246,5 +2346,76 @@ mod tests {
             "the swap must be bounded by the timeout, not the build"
         );
         assert_eq!(stopped.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn sustain_monitor_downgrades_once_and_never_oscillates() {
+        let mut monitor = SustainMonitor::new(StreamProfile::DEFAULT_1080P30);
+        let slow = Duration::from_millis(50); // > the 33.3 ms 1080p30 budget
+
+        for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK - 1 {
+            assert_eq!(monitor.observe(slow), SustainAction::Continue);
+        }
+        assert_eq!(
+            monitor.observe(slow),
+            SustainAction::Downgrade,
+            "the 30th consecutive slow frame trips the fallback"
+        );
+        for _ in 0..200 {
+            assert_eq!(
+                monitor.observe(slow),
+                SustainAction::Continue,
+                "a downgraded monitor must never ask again"
+            );
+        }
+    }
+
+    #[test]
+    fn sustain_monitor_resets_the_streak_on_an_on_budget_frame() {
+        let mut monitor = SustainMonitor::new(StreamProfile::DEFAULT_1080P30);
+        let slow = Duration::from_millis(50);
+        let fast = Duration::from_millis(5);
+
+        for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK - 1 {
+            monitor.observe(slow);
+        }
+        monitor.observe(fast); // proves the host can keep up; reset
+        for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK - 1 {
+            assert_eq!(monitor.observe(slow), SustainAction::Continue);
+        }
+        assert_eq!(monitor.observe(slow), SustainAction::Downgrade);
+    }
+
+    #[test]
+    fn sustain_monitor_never_downgrades_from_the_floor() {
+        let mut monitor = SustainMonitor::new(StreamProfile::SAFE_720P30);
+        let slow = Duration::from_millis(50);
+        for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK * 4 {
+            assert_eq!(monitor.observe(slow), SustainAction::Continue);
+        }
+    }
+
+    #[test]
+    fn sustain_monitor_reopens_only_above_the_floor() {
+        let mut monitor = SustainMonitor::new(StreamProfile::DEFAULT_1080P30);
+        let slow = Duration::from_millis(50);
+        for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK {
+            monitor.observe(slow); // trips and latches
+        }
+        assert_eq!(monitor.observe(slow), SustainAction::Continue, "latched");
+
+        // A manual change above the floor re-arms exactly one more evaluation.
+        monitor.note_manual_bitrate(StreamProfile::DEFAULT_1080P30);
+        for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK - 1 {
+            assert_eq!(monitor.observe(slow), SustainAction::Continue);
+        }
+        assert_eq!(monitor.observe(slow), SustainAction::Downgrade);
+
+        // At the floor, a manual change does not re-arm.
+        let mut at_floor = SustainMonitor::new(StreamProfile::SAFE_720P30);
+        at_floor.note_manual_bitrate(StreamProfile::SAFE_720P30);
+        for _ in 0..SUSTAIN_FRAMES_BEFORE_FALLBACK * 2 {
+            assert_eq!(at_floor.observe(slow), SustainAction::Continue);
+        }
     }
 }
