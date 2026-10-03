@@ -18,8 +18,18 @@ function mockPeer() {
   let trackHandler:
     ((t: MediaStreamTrackLike, s: MediaStreamLike[]) => void) | null = null;
   let stateHandler: ((state: string) => void) | null = null;
+  let controlOpen = false;
+  let controlHandler: ((msg: unknown) => void) | null = null;
   const removeTrackHandler = vi.fn();
   const removeStateHandler = vi.fn();
+  const removeControlHandler = vi.fn();
+  const sendJson = vi.fn();
+  // Default: the control channel opens. A test can re-point this to a rejecting
+  // mock to exercise the never-opens warning path.
+  const waitForChannel = vi.fn(async (_label: string, _timeoutMs?: number) => ({
+    label: 'control',
+    readyState: 'open',
+  }));
 
   return {
     peer: {
@@ -35,12 +45,31 @@ function mockPeer() {
         stateHandler = handler;
         return removeStateHandler;
       }),
+      dataChannels: {
+        hasChannel: vi.fn((_label: string) => controlOpen),
+        onMessage: vi.fn((_label: string, handler: (msg: unknown) => void) => {
+          controlHandler = handler;
+          return removeControlHandler;
+        }),
+        sendJson,
+      },
+      // `subscribeControl` fires a best-effort `waitForChannel`; without this
+      // stub the call would throw inside `start()` and break every existing
+      // test. Default: resolve (the channel opened).
+      waitForChannel,
     } as unknown as PeerConnection,
     emitTrack: (t: MediaStreamTrackLike, s: MediaStreamLike[]) =>
       trackHandler?.(t, s),
     emitState: (state: string) => stateHandler?.(state),
+    emitControl: (msg: unknown) => controlHandler?.(msg),
+    setControlOpen: (open: boolean) => {
+      controlOpen = open;
+    },
+    sendJson,
+    waitForChannel,
     removeTrackHandler,
     removeStateHandler,
+    removeControlHandler,
   };
 }
 
@@ -150,6 +179,175 @@ describe('DesktopClient', () => {
     emitState('connected');
 
     expect(states).toEqual(['connecting']);
+    client.close();
+  });
+});
+
+describe('DesktopClient control surface', () => {
+  /** A connected client: start() resolved, so the control subscription is live. */
+  async function connected() {
+    const mock = mockPeer();
+    const client = new DesktopClient('agent-1', mock.peer);
+    const started = client.start();
+    mock.emitTrack(fakeTrack, fakeStreams);
+    await started;
+    return { ...mock, client };
+  }
+
+  const oneSource = {
+    id: 'monitor:1',
+    kind: 'monitor' as const,
+    name: 'eDP-1',
+    width: 1920,
+    height: 1080,
+    x: 0,
+    y: 0,
+    scaleFactor: 1,
+    rotation: 0,
+    isPrimary: true,
+    default: true,
+  };
+
+  it('dispatches desktop-sources to onSources and re-fires on a second frame', async () => {
+    const { client, emitControl } = await connected();
+    const seen: unknown[] = [];
+    client.onSources((sources) => seen.push(sources));
+
+    emitControl({
+      type: 'desktop-sources',
+      channel: 'control',
+      payload: { sources: [oneSource] },
+      timestamp: 1,
+    });
+    emitControl({
+      type: 'desktop-sources',
+      channel: 'control',
+      payload: { sources: [] },
+      timestamp: 2,
+    });
+
+    expect(seen).toEqual([[oneSource], []]);
+    client.close();
+  });
+
+  it('stops delivering onSources after unsubscribe', async () => {
+    const { client, emitControl } = await connected();
+    const seen: unknown[] = [];
+    const off = client.onSources((sources) => seen.push(sources));
+
+    off();
+    emitControl({
+      type: 'desktop-sources',
+      channel: 'control',
+      payload: { sources: [oneSource] },
+      timestamp: 1,
+    });
+
+    expect(seen).toEqual([]);
+    client.close();
+  });
+
+  it('dispatches desktop-stats to onStats', async () => {
+    const { client, emitControl } = await connected();
+    const seen: unknown[] = [];
+    client.onStats((stats) => seen.push(stats));
+
+    emitControl({
+      type: 'desktop-stats',
+      channel: 'control',
+      payload: {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        targetBitrateBps: 6_000_000,
+      },
+      timestamp: 1,
+    });
+
+    expect(seen).toEqual([
+      { width: 1920, height: 1080, fps: 30, targetBitrateBps: 6_000_000 },
+    ]);
+    client.close();
+  });
+
+  it('ignores an unknown control type without error', async () => {
+    const { client, emitControl } = await connected();
+    const sources: unknown[] = [];
+    client.onSources((s) => sources.push(s));
+
+    expect(() =>
+      emitControl({
+        type: 'desktop-future',
+        channel: 'control',
+        payload: {},
+        timestamp: 1,
+      }),
+    ).not.toThrow();
+    expect(sources).toEqual([]);
+    client.close();
+  });
+
+  it('selectSource sends a desktop-select frame when the channel is open', async () => {
+    const { client, sendJson, setControlOpen } = await connected();
+    setControlOpen(true);
+
+    client.selectSource('window:0x4a00007');
+
+    expect(sendJson).toHaveBeenCalledWith('control', 'desktop-select', {
+      sourceId: 'window:0x4a00007',
+    });
+    client.close();
+  });
+
+  it('setBitrate sends a desktop-bitrate frame when the channel is open', async () => {
+    const { client, sendJson, setControlOpen } = await connected();
+    setControlOpen(true);
+
+    client.setBitrate(2_500_000);
+
+    expect(sendJson).toHaveBeenCalledWith('control', 'desktop-bitrate', {
+      bitrateBps: 2_500_000,
+    });
+    client.close();
+  });
+
+  it('selectSource and setBitrate warn instead of throwing when the channel is absent', async () => {
+    const { client, sendJson, setControlOpen } = await connected();
+    setControlOpen(false);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(() => client.selectSource('monitor:1')).not.toThrow();
+    expect(() => client.setBitrate(1_000_000)).not.toThrow();
+    expect(sendJson).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+
+    warn.mockRestore();
+    client.close();
+  });
+
+  it('warns when the control channel never opens, without failing start()', async () => {
+    const mock = mockPeer();
+    // A channel that never opens: `waitForChannel` rejects after the timeout.
+    mock.waitForChannel.mockRejectedValueOnce(
+      new Error('timeout waiting for channel "control"'),
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const client = new DesktopClient('agent-1', mock.peer);
+
+    const started = client.start();
+    mock.emitTrack(fakeTrack, fakeStreams);
+    // Media must still resolve — a missing control channel is not fatal.
+    await expect(started).resolves.toEqual({
+      track: fakeTrack,
+      streams: fakeStreams,
+    });
+    // Let the fire-and-forget rejection settle.
+    await Promise.resolve();
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('control channel did not open'),
+    );
+    warn.mockRestore();
     client.close();
   });
 });
