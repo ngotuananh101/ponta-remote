@@ -16,14 +16,14 @@ The roadmap item is "Tăng chất lượng/khung hình, adaptive bitrate" and "C
 Two constraints shape the design:
 
 - **Software H.264 headroom is real but thin.** A measured benchmark (§3.1) puts 1080p30 at ~28 ms/frame against a 33.3 ms budget — 1.2× headroom, and 1080p60 is infeasible. Quality is therefore a *conditional* target with an explicit safe floor, not a promise (ADR-24).
-- **openh264 0.9.8 cannot reconfigure at runtime through its public API.** `Encoder::reinit` and the config it reads are private (§3.2). Runtime bitrate change is only possible via the `unsafe` raw API or by rebuilding the encoder. This makes adaptive bitrate a **spike-gated** feature (ADR-23).
+- **openh264 0.9.8 cannot reconfigure at runtime through its public API.** `Encoder::reinit` and the config it reads are private (§3.2), so a runtime bitrate change is only reachable through the `unsafe` raw API. This made adaptive bitrate **spike-gated** (ADR-23) — and the spike has now **passed** (§3.7): the `unsafe` path retargets cleanly, no rebuild and no blip, so auto-ABR ships.
 
 ### 1.1 Core Goals
 
 1. **A runtime quality profile replaces the Week 7 constants.** `StreamProfile { max_width, max_height, fps, bitrate_bps }` is resolved at session start; `downscale`'s box, the ticker cadence, and the encoder are all built from it. Default **1080p30**, safe floor **720p30** (ADR-21, ADR-24).
-2. **Manual bitrate control from the browser.** A desktop control channel carries a `desktop-bitrate` frame; the browser exposes a small bitrate control. This is the guaranteed half of the ABR work: the agent applies a new target by **rebuilding the encoder** (openh264 cannot retarget in place, §3.2), accepting one IDR blip on an explicit user action. It ships whether or not the spike passes (ADR-23).
+2. **Manual bitrate control from the browser.** A desktop control channel carries a `desktop-bitrate` frame; the browser exposes a small bitrate control. The agent applies a new target **in place** via `raw_api().set_option(ENCODER_OPTION_BITRATE, …)` — no rebuild, no keyframe blip (§3.7, ADR-23). This is the guaranteed half of the ABR work and ships regardless of the spike outcome (ADR-23).
 3. **Screen/window picker.** The agent enumerates monitors and windows via `xcap` (already available — §3.4) and sends a `desktop-sources` list over the control channel; the browser shows a picker. The agent streams the default source immediately; a `desktop-select` for a **different** source switches the live stream (one IDR blip, ADR-22).
-4. **Spike-gated adaptive bitrate.** A half-day spike determines whether `unsafe raw_api()` `SetOption` can retarget the encoder at runtime without a visible glitch. **PASS** → GCC-driven auto-ABR (using webrtc-rs's built-in estimator, §3.3) ships in this week. **FAIL** → auto-ABR is a Non-Goal with recorded evidence; only manual control ships (ADR-23).
+4. **Adaptive bitrate (spike resolved PASS).** The half-day spike confirmed `unsafe raw_api()` `SetOption` retargets the encoder at runtime with no visible glitch (§3.7), so **GCC-driven auto-ABR ships this week** (using webrtc-rs's built-in estimator, §3.3), alongside manual control. It remains a **goal, not an acceptance criterion** (ADR-23, §10.2).
 5. **A timeboxed hardware-codec spike.** A half-day investigation of AV1 / H.264 hardware encode on the agent, to inform a *later* decision. It is a prerequisite for nothing and gates no acceptance criterion (ADR-25).
 6. **Automated + manual verification.** Rust unit tests for the profile/geometry/encoder path, TS unit tests for the control client and picker, E2E coverage of the control channel and source selection, and a manual demo showing 1080p30 (or the documented fallback) in real Chrome.
 
@@ -32,7 +32,7 @@ Two constraints shape the design:
 - **Input forwarding (mouse/keyboard).** Owned by Week 9; no input handling is added here. The desktop offer stays media + control only.
 - **Hardware codec (H.265/HEVC, AV1, H.264 hardware).** **H.265 is not viable in WebRTC in any browser today** — MDN lists Chrome, Edge, Firefox, Opera and Safari all as **"No"** for HEVC in WebRTC (§3.5). A timeboxed spike explores alternatives but commits nothing (ADR-25).
 - **Software 1080p60.** Measured at 0.6× realtime (§3.1) — infeasible with software H.264; deferred to a hardware path.
-- **Auto-ABR if the spike fails.** Conditional by construction (ADR-23); the spec carries both branches so a failed spike shrinks scope without an edit.
+- **Auto-ABR if the spike fails.** Conditional by construction (ADR-23); the spec carries both branches so a failed spike shrinks scope without an edit. **Note: the spike PASSED (§3.7) ⇒ this branch does not apply; auto-ABR ships.**
 - **Automatic mid-session source re-selection.** A user-initiated `desktop-select` switch ships (ADR-22), but there is no automatic re-selection (e.g. following the focused window). Selection is explicit.
 - **Multi-monitor coordinate mapping / input.** The picker exposes geometry, but mapping browser input to source coordinates is Week 9 (input forwarding) and is out of scope here.
 - **File transfer.** Owned by Phase 4 (Tuần 10-11), which remains a stub (`ARCHITECTURE.md:946-948`) and is not touched.
@@ -135,16 +135,16 @@ A standalone benchmark (throwaway binary, 2026-10-03) built the encoder with the
 
 - `Encoder::reinit(width, height)` is **private** (`openh264-0.9.8/src/encoder.rs:950`) and reads `self.config.target_bitrate` / `self.config.max_frame_rate` (lines 972, 974); `self.config` is private. `reinit` is only reached automatically when the frame **dimensions change** (`encode_at`, lines 909/913), and it re-applies the *same* config — so a dimension change does not help change the bitrate.
 - There is **no public API** to change bitrate at runtime. Two paths exist:
-  1. `pub const unsafe fn raw_api(&mut self) -> &mut EncoderRawAPI` (`encoder.rs:1062`) exposes `set_option` (wired at `encoder.rs:60`), letting a caller push a modified `SEncParamExt` (including `iTargetBitrate`) via `ENCODER_OPTION_SVC_ENCODE_PARAM_EXT`. This is the **spike's hypothesis** (§1.1 goal 4, ADR-23) — whether it applies without a visible glitch is unverified.
+  1. `pub const unsafe fn raw_api(&mut self) -> &mut EncoderRawAPI` (`encoder.rs:1062`) exposes `set_option` (wired at `encoder.rs:60`). Two options apply here: `ENCODER_OPTION_SVC_ENCODE_PARAM_EXT` (pushes a modified `SEncParamExt`) and `ENCODER_OPTION_BITRATE` (takes `SBitrateInfo { iLayer, iBitrate }`). The spike (§3.7) confirmed the latter — **verified to retarget in place with no visible glitch**.
   2. Rebuild the `Encoder` with a new `EncoderConfig` — guaranteed to work, but emits a fresh SPS/PPS + IDR (a visible keyframe blip) on every change.
-- **Consequence.** Runtime bitrate change is possible-but-unproven (path 1) or possible-with-glitch (path 2). ADR-23 makes the choice spike-gated.
+- **Consequence.** Runtime bitrate change is possible in place (path 1, confirmed by §3.7 — the shipped design) or with a glitch (path 2, the fallback). ADR-23 records the choice.
 
 ### 3.3 `webrtc` / `rtc` 0.21.0 — congestion control is built in
 
 - Send-side congestion control exists and is not something we must implement: `ReportingEstimator::new(Gcc::new(INITIAL, MIN, MAX))` + `configure_congestion_control(registry, estimator, CongestionFeedback::Twcc, &mut media_engine)` — the shipped example `webrtc-0.21.0/examples/bandwidth-estimation-from-disk/bandwidth-estimation-from-disk.rs` builds exactly this.
 - The estimator drives `Attribute::TargetBitrateChanged` into the interceptor chain (`rtc-0.21.0/src/peer_connection/handler/interceptor.rs:782`), and the value surfaces in outbound-rtp `target_bitrate` stats.
 - `RtpSender::set_parameters(RTCRtpSendParameters, Option<RTCSetParameterOptions>)` (`rtc-0.21.0/src/rtp_transceiver/rtp_sender/mod.rs:307`) updates encoding parameters (max bitrate, frame rate) at runtime; `RTCRtpEncodingParameters.max_bitrate` is the field.
-- **Consequence.** The *transport* half of ABR is available. The unknown half is applying a target to openh264 (§3.2) — which is what the spike settles.
+- **Consequence.** The *transport* half of ABR is available. The encoder half is applying a target to openh264 (§3.2) — settled by the spike (§3.7, PASS).
 
 ### 3.4 `xcap` 0.9.8 — enumeration and geometry already exist
 
@@ -159,11 +159,28 @@ A standalone benchmark (throwaway binary, 2026-10-03) built the encoder with the
 
 ### 3.6 What cannot be verified from this repository
 
-- Whether `unsafe raw_api()` `SetOption` retargets bitrate without a glitch — the spike (ADR-23) answers this.
+(The ADR-23 runtime-retarget question was on this list; the spike has since **verified it — §3.7**.)
+
 - Real-screen encode cost at 1080p30 (the §3.1 number is synthetic) — manual demo only.
 - Whether a weaker-than-i5 host sustains 1080p30 — the fallback (§ADR-24) covers it; not gated.
 - AV1 / H.264 hardware availability on real agents — the spike (ADR-25) investigates, does not commit.
 - macOS/Windows runtime capture — compile + unit tests only.
+
+### 3.7 ADR-23 runtime bitrate retarget — measured (spike PASSED)
+
+The ADR-23 spike ran as a standalone binary (2026-10-03), reproducing the openh264 call path the agent would use. Environment: Docker `rust:1.98-bookworm`, `openh264` 0.9.8, **320×240 @ 30 fps**, `RateControlMode::Bitrate`, 120 frames, retarget applied at **frame 60**. The method and results are embedded here rather than pointed at a scratch directory, so they are reproducible from the spec alone.
+
+| Case | Retarget | avg bytes/frame before → after | ratio | rc | `GetOption` after | blip |
+|---|---|---|---|---|---|---|
+| CONTROL | none | 4093 → 4093 | 1.00× | 0 | 1_000_000 | 0 |
+| A | 1.0 M → 0.25 M | 4020 → 1044 | **0.26×** | 0 | 250_000 | 0 |
+| B | 1.0 M → 2.0 M | 4020 → 8351 | **2.08×** | 0 | 2_000_000 | 0 |
+| C | 1.0 M → 0.25 M via `SVC_ENCODE_PARAM_EXT` | 4020 → 1044 | **0.26×** | 0 | 250_000 | 0 |
+
+- **The measured frame-size ratio matches the bitrate ratio** (0.25× target → 0.26× bytes; 2.0× target → 2.08× bytes), so the retarget is proven by real encoded bytes, not merely by `GetOption` echoing the value back. `rc = 0` on every `set_option` call.
+- **Blip detector.** The encoder is configured with `uiIntraPeriod = 1_000_000` and `scene_change_detect = false`, so the only IDR is frame 0; the harness counts NAL types 7 (SPS) / 8 (PPS) / 5 (IDR) **after** frame 0. CONTROL reports **0** ⇒ the detector does not false-positive, so the 0 counts for A/B/C are meaningful: **no SPS/PPS/IDR is emitted on a retarget**, on either path.
+- **Honest caveats.** (i) 115/120 frames decoded in **every** case including CONTROL — 5 frames skipped by openh264's `bEnableFrameSkip` at this small resolution; **0 decode errors**. (ii) The `ScreenContentRealTime` usage type forces scene-change detection on, which emits an IDR *every* frame and would mask the detector; the spike therefore used `CameraVideoRealTime` so the intra period above actually holds. **Watch item:** the agent's own encoder uses `ScreenContentRealTime` (§3.1, §6.1), so whether that interaction forces an IDR per frame in the production config must be re-checked at implementation time — this spike does not settle it, and it bears on the ADR-24 fallback's IDR assumptions.
+- **Consequence.** ADR-23's PASS branch is the shipped design: the agent retargets via `raw_api().set_option`, no encoder rebuild, no keyframe blip. §3.6's "cannot be verified" item is now closed.
 
 ---
 
@@ -200,20 +217,25 @@ Two constants are named and configurable (env/CLI), not inline magic numbers:
 
 **Consequence.** A source switch mid-session **is** supported (contrary to the initial "fixed for the session" wording), because streaming already started and switching is just a `run_stream` restart. This is a deliberate, bounded capability: one switch at a time, driven by explicit user action, not an automatic mid-stream re-selection. The picker's cost is one IDR blip on switch, acceptable for a user-initiated action. The test-pattern source enumerates one `default: true` entry so E2E auto-selects with no interaction (§8.3).
 
-### ADR-23: Adaptive bitrate is spike-gated; manual bitrate control ships unconditionally
+### ADR-23: Adaptive bitrate retargets in place; manual bitrate control ships unconditionally
 
-**Context.** The transport half of ABR exists in webrtc-rs 0.21 (§3.3), but the encoder half does not: openh264 0.9.8 cannot change bitrate through its public API (§3.2). Applying a new target needs either `unsafe raw_api()` `SetOption` (unproven) or an encoder rebuild (visible keyframe blip).
+**Context.** The transport half of ABR exists in webrtc-rs 0.21 (§3.3), but the encoder half does not: openh264 0.9.8 cannot change bitrate through its public API (§3.2). Applying a new target needs either `unsafe raw_api()` `SetOption` (unproven at decision time — **since proven, §3.7**) or an encoder rebuild (visible keyframe blip).
 
 **Decision.** A **half-day spike, before any ABR commit**, tests whether `unsafe raw_api()` `SetOption` retargets the encoder at runtime **without a visible glitch**, judged by: (a) the call returns success, (b) the next frames use the new target, (c) no SPS/PPS/IDR blip is observed on the decoder side.
 
-- **Spike PASS** → ship **GCC-driven auto-ABR**: `ReportingEstimator::new(Gcc::new(...))` + `configure_congestion_control(..., CongestionFeedback::Twcc, ...)`, feeding `RtpSender::set_parameters` and the encoder target. This is a **goal** of the week, not a criterion (§10.2).
+**Outcome — spike PASSED** (§3.7): all three criteria met (rc = 0, measured frame-size ratio matches the bitrate ratio, zero SPS/PPS/IDR after frame 0). The PASS branch below is therefore the shipped design; the FAIL branch is retained only as the design's other half.
+
+- **Spike PASS (taken)** → ship **GCC-driven auto-ABR**: `ReportingEstimator::new(Gcc::new(...))` + `configure_congestion_control(..., CongestionFeedback::Twcc, ...)`, feeding `RtpSender::set_parameters` and the encoder target. The runtime retarget uses **`ENCODER_OPTION_BITRATE` (option 5)** through `raw_api().set_option`, which takes `SBitrateInfo { iLayer, iBitrate }` and only rescales the bitrate — cleaner than `SVC_ENCODE_PARAM_EXT` because it does not run `ParamTranscode`/`WelsEncoderParamAdjust`. This is a **goal** of the week, not a criterion (§10.2).
 - **Spike FAIL** → auto-ABR is a **Non-Goal with recorded evidence**; only **manual bitrate control** ships (a `desktop-bitrate` frame that the agent applies by rebuild, accepting the one-time blip on an explicit user action).
 
 Manual bitrate control and the fixed-quality profile (ADR-21) ship **regardless of the spike**.
 
 **Rationale.** The spike is a prerequisite, not a deliverable: making acceptance depend on an unrun experiment would let an unknown silently change scope. Both branches are written here so a FAIL shrinks scope without editing this spec.
 
-**Consequence.** §10.2 acceptance criteria do not reference the spike. If the spike fails, the ABR goal in §1.1 becomes a documented Non-Goal and the manual path is the shipped feature.
+**Consequence.** §10.2 acceptance criteria do not reference the spike (it stays a goal, not a gate, even now that it passed). With the PASS branch taken, both manual control and auto-ABR retarget **in place, with no rebuild and no keyframe blip** — the "one IDR blip" cost mentioned for manual control in §1.1/§6.4 applies only to the (unshipped) FAIL path. Two implementation traps, both measured in the spike, are recorded so the implementer does not rediscover them:
+
+- **Raising** the bitrate needs **two** calls in order: `set_option(ENCODER_OPTION_MAX_BITRATE, SPATIAL_LAYER_0, target)` **first**, then `set_option(ENCODER_OPTION_BITRATE, SPATIAL_LAYER_ALL, target)`. Setting only the top-level `iMaxBitrate` leaves `sSpatialLayers[0].iMaxSpatialBitrate` unset → `WelsBitRateVerification` fails with rc = 1. **Lowering** the bitrate does not need the extra step.
+- Neither path forces an IDR/SPS/PPS.
 
 ### ADR-24: 1080p30 is a conditional target with a 720p30 safe floor; software 1080p60 is a Non-Goal
 
@@ -223,7 +245,7 @@ Manual bitrate control and the fixed-quality profile (ADR-21) ship **regardless 
 
 **Rationale.** States the real headroom instead of promising a number the hardware may not hold. The fallback keeps the stream smooth rather than janky on weaker hosts.
 
-**Consequence.** The fallback is a resolution change → an encoder rebuild (openh264 cannot resize without it, §3.2) → a one-time IDR blip; this coupling is why the fallback is exercised by the same spike mechanism as ADR-23. If the spike fails, the fallback may be dropped in favour of a fixed 720p30 default on hosts that cannot sustain 1080p30.
+**Consequence.** The fallback is a resolution change → an encoder rebuild (openh264 cannot resize without it, §3.2) → a one-time IDR blip; this coupling is why the fallback is exercised by the same spike mechanism as ADR-23. (ADR-23's spike passed — §3.7 — so the fallback is not dropped; a fixed 720p30 default remains the alternative only on a host that cannot sustain 1080p30 at all.)
 
 ### ADR-25: Hardware codec is investigated by a timeboxed spike, not committed
 
@@ -402,7 +424,7 @@ loop select stop / control / ticker:
         write_sample(...)
 ```
 
-- **`apply_bitrate`** is the spike-gated seam (ADR-23): if the spike **passed**, `unsafe { encoder.raw_api() }` + `SetOption(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, params with iTargetBitrate = bps)` — no rebuild, no blip. If the spike **failed**, rebuild the encoder from `profile.with_bitrate(bps)` and force an IDR (one blip, on explicit user action). Either way the value is reflected in the next `desktop-stats`.
+- **`apply_bitrate`** uses the spike's confirmed mechanism (ADR-23, §3.7): `unsafe { encoder.raw_api() }` + `set_option(ENCODER_OPTION_BITRATE, SPATIAL_LAYER_ALL, SBitrateInfo { iBitrate: bps })` — **no rebuild, no blip**. When **raising** the target, set `ENCODER_OPTION_MAX_BITRATE` on `SPATIAL_LAYER_0` **first** (otherwise `WelsBitRateVerification` fails rc = 1); lowering needs only the single call. The value is reflected in the next `desktop-stats`. (The rebuild-and-force-IDR path in ADR-23's FAIL branch is not shipped.)
 - **Source swap**: stop the old `FrameSource`, `source_for(id, profile)`, build a new encoder (dimensions may differ), swap both. Bounded by `DESKTOP_SELECT_APPLY_TIMEOUT`; a source that fails to start leaves the current stream running and logs.
 - **Sustain fallback** (ADR-24): count consecutive frames whose encode time exceeds the frame budget; at a threshold (default 30 frames ≈ 1 s) rebuild at `SAFE_720P30`, emit a `desktop-stats` with `status.kind = 'quality-downgraded'` (its `width`/`height` already reflect the new size), and do not oscillate (a hysteresis: only downgrade once per session unless the user raises bitrate manually).
 
@@ -415,7 +437,7 @@ loop select stop / control / ticker:
 | `source_for` | unknown id → `Err`; a monitor id → `ScreenSource`; a window id → `WindowSource` |
 | `downscale` with profile | 1920×1080 → 1280×720 under `SAFE_720P30`; → 1920×1080 (passthrough) under `DEFAULT_1080P30` |
 | control decode | `desktop-select`/`desktop-bitrate` frames decode to `SourceSwap`/`SetBitrate`; `channel != "control"` dropped; unknown `type` ignored |
-| `apply_bitrate` | sets the encoder target; the next encoded frame is emitted (spike PASS path) or a new encoder is built (FAIL path) |
+| `apply_bitrate` | sets the encoder target in place (spike PASS path, §3.7); the next encoded frame is emitted with the new target; the raise case performs the MAX_BITRATE-first ordering |
 | sustain fallback | a synthetic slow-encode sequence downgrades once to `SAFE_720P30` and does not oscillate |
 
 ---
@@ -498,7 +520,7 @@ No new workflow changes are required beyond Week 7's apt steps: the control chan
 | Source **switch** works on a real multi-source host | Manual demo (§8.4) |
 | 1080p30 / 720p30 fallback on a real screen | Manual demo (§8.4) |
 | 1080p60 software infeasible | Benchmark (§3.1, Appendix A) |
-| Runtime bitrate apply (spike) | Spike (ADR-23); unit test pins both branches |
+| Runtime bitrate apply (spike) | **Spike §3.7 (PASSED)**; unit test pins the shipped `ENCODER_OPTION_BITRATE` path |
 | macOS/Windows compile | `Build Agent / macOS/x64`, `Build Agent / macOS/arm64`, `Build Agent / Windows/x64-msvc` |
 
 ---
@@ -521,7 +543,7 @@ No new workflow changes are required beyond Week 7's apt steps: the control chan
 |---|---|---|
 | D1 | `packages/shared`: `types/desktop.ts` (source/stats types) + re-export | Code |
 | D2 | `packages/desktop-core`: `DesktopClient` control surface + tests | Code |
-| D3 | `apps/agent`: `StreamProfile`, `enumerate_sources`/`source_for`, `WindowSource`, control channel + dispatcher, `run_stream` profile/control/fallback, `main.rs` CLI/env | Code |
+| D3 | `apps/agent`: `StreamProfile`, `enumerate_sources`/`source_for`, `WindowSource`, control channel + dispatcher, `run_stream` profile/control/fallback, GCC auto-ABR + in-place retarget (§3.7), `main.rs` CLI/env | Code |
 | D4 | `apps/web`: store (`channelLabels: ['control']`, sources/stats/select/bitrate), `DesktopView` picker + bitrate + stats | Code |
 | D5 | `packages/webrtc-core/test/e2e/desktop.e2e.test.ts` extensions (control channel, bitrate, regression) | Test |
 | D6 | Benchmark harness — committed under `apps/agent/benches/` **or** recorded verbatim in this spec's Appendix A (decided at implementation time; see Appendix A note) | Infra |
@@ -537,14 +559,14 @@ No new workflow changes are required beyond Week 7's apt steps: the control chan
 5. The recorded manual demo shows a real-screen stream in Chrome at 1080p30 (or the documented 720p30 fallback on a host that cannot sustain it), the source picker listing monitors/windows, a working source switch, and a visible bitrate change — with LAN glass-to-glass latency observed under 200 ms (informal, not gated).
 6. `ARCHITECTURE.md` records the Week 8 scope and the perf-table row no longer names H.265 as an achievable target (§11).
 
-**Not** an acceptance criterion: the ADR-23 spike result and the ADR-25 hardware-codec spike. Both are prerequisites/investigations that shape scope without gating delivery (ADR-23, ADR-25).
+**Not** an acceptance criterion: auto-ABR (ADR-23, now confirmed by the passed spike §3.7) and the ADR-25 hardware-codec spike. Both are goals/investigations that shape scope without gating delivery.
 
 ### 10.3 Delivery sequence (single PR, `feat/phase3-week8-stream-quality`)
 
 1. `packages/shared` desktop types.
 2. `packages/desktop-core` control surface + tests.
 3. Agent `StreamProfile` + enumeration + `WindowSource` + Rust tests.
-4. Agent control channel + dispatcher + `run_stream` changes (bitrate, swap, fallback).
+4. Agent control channel + dispatcher + `run_stream` changes (in-place bitrate retarget, swap, fallback) + GCC auto-ABR wiring.
 5. Web store + `DesktopView` + tests.
 6. E2E extensions + benchmark harness/Appendix.
 7. ARCHITECTURE.md reconciliation + demo recording.
@@ -553,7 +575,7 @@ No new workflow changes are required beyond Week 7's apt steps: the control chan
 ### 10.4 Review focus
 
 - **Default-source ordering** — the source is created *before* the answer (clean-refusal invariant, ADR-22); a swap happens only after, via `run_stream`.
-- **Spike branch hygiene** — `apply_bitrate` has both branches and neither is dead code; acceptance does not reference the spike (ADR-23).
+- **Retarget correctness** — `apply_bitrate` uses the spike-confirmed `ENCODER_OPTION_BITRATE` path with the raise-order trap handled (MAX_BITRATE on SPATIAL_LAYER_0 first, §3.7); acceptance does not reference the spike (ADR-23).
 - **No input handling** — `DesktopView` gains control chrome only; the `<video>` keeps no `controls` and no pointer/keyboard handlers (Week 9).
 - **Validation** — `desktop-select` ids are checked against the enumeration; `desktop-bitrate` is clamped.
 - **Backward compatibility** — terminal bytes unchanged; the Week 7 desktop media E2E passes unchanged.
@@ -565,7 +587,7 @@ No new workflow changes are required beyond Week 7's apt steps: the control chan
 
 Two drifts are reconciled in the same PR (D8):
 
-1. **Roadmap §8** (`ARCHITECTURE.md:941-944`): the "Tuần 8-9: Chất lượng & tương tác (sắp tới)" list gains a Week 8 sub-entry marked done for this week's items — quality profile + manual bitrate, source picker — with input forwarding and hardware codec noted as still open (Week 9 / spike). Week 9's input item is left unchecked (owned by Spec B).
+1. **Roadmap §8** (`ARCHITECTURE.md:941-944`): the "Tuần 8-9: Chất lượng & tương tác (sắp tới)" list gains a Week 8 sub-entry marked done for this week's items — quality profile + manual bitrate + GCC auto-ABR (spike passed, §3.7), source picker — with input forwarding and hardware codec noted as still open (Week 9 / spike). Week 9's input item is left unchecked (owned by Spec B).
 2. **Perf table (§11, `ARCHITECTURE.md:1080-1081`)**: the row `Desktop stream (Phase 3 target) | 60fps | Hardware H.265` is corrected — H.265 is not viable in WebRTC (§3.5). Replace with `Desktop stream (Week 8) | 1080p30 (720p30 floor) | Software H.264 (openh264)` and a `Desktop stream (hardware, future) | 60fps | H.264 hardware / AV1 (spike-gated, ADR-25)` row that names the viable alternatives instead of the unusable one.
 
 Phase 4's stub (`ARCHITECTURE.md:946-948`) is **not** touched (Phase 4 is out of scope; §1.2).
