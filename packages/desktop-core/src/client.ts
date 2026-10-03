@@ -298,34 +298,31 @@ export class DesktopClient {
    * `wheel`, `key`, `text`) go straight through — dropping a click would be a
    * correctness bug. `pointer-move` is coalesced to `inputRateLimitHz`: the
    * first move in a window is forwarded immediately (leading edge, so a single
-   * move is never swallowed) and later moves in the same window are held, the
-   * newest position winning, and flushed at most once per window (trailing
-   * edge). No-op + warn when the control channel is not open, mirroring
-   * `sendControl`; a DOM event handler must never throw into the UI.
+   * move is never swallowed) and locks the window for 1/inputRateLimitHz s.
+   * Intermediate moves update `pendingMove`, and each window flush delivers the
+   * newest position and re-arms until the pointer settles. No-op + warn when
+   * the control channel is not open, mirroring `sendControl`; a DOM event
+   * handler must never throw into the UI.
    */
   sendInput(event: DesktopInput): void {
     if (event.kind !== 'pointer-move') {
       this.sendControl('desktop-input', event);
       return;
     }
-    const firstInWindow = !this.moveFlushScheduled;
     this.pendingMove = event;
-    if (firstInWindow) {
-      // Leading edge: forward now and open the window so a lone move is
-      // delivered without waiting for the timer.
-      this.flushPendingMove();
-    }
     if (this.moveFlushScheduled) return;
-    this.moveFlushScheduled = true;
-    const delayMs = Math.max(0, Math.round(1000 / this.inputRateLimitHz));
-    setTimeout(() => this.flushPendingMove(), delayMs);
+    this.flushPendingMove();
   }
 
   private flushPendingMove(): void {
     this.moveFlushScheduled = false;
     const move = this.pendingMove;
     this.pendingMove = null;
-    if (move) this.sendControl('desktop-input', move);
+    if (!move) return;
+    this.sendControl('desktop-input', move);
+    this.moveFlushScheduled = true;
+    const delayMs = Math.max(0, Math.round(1000 / this.inputRateLimitHz));
+    setTimeout(() => this.flushPendingMove(), delayMs);
   }
 
   private sendControl(type: string, payload: unknown): void {

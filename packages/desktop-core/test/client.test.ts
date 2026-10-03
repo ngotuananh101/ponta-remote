@@ -623,6 +623,31 @@ describe('DesktopClient input surface (Week 9, spec §5.3)', () => {
     }
   });
 
+  it('strictly caps continuous pointer-move throughput to inputRateLimitHz', async () => {
+    vi.useFakeTimers();
+    try {
+      const { client, setControlState } = await connected({
+        inputRateLimitHz: 60,
+      });
+      setControlState('open');
+
+      // Simulate a 500 Hz gaming mouse moving continuously for 1000 ms (1 move every 2 ms).
+      for (let t = 0; t <= 1000; t += 2) {
+        client.sendInput({ kind: 'pointer-move', x: t / 1000, y: 0 });
+        vi.advanceTimersByTime(2);
+      }
+
+      const moves = sentInputs().filter(isKind('pointer-move'));
+      // At 60 Hz over 1000 ms, at most ~61 frames (leading edge + 60 interval flushes).
+      // A bug that flushes both leading and trailing edges yields ~111-120 frames.
+      expect(moves.length).toBeLessThanOrEqual(61);
+      expect(moves.length).toBeGreaterThanOrEqual(58);
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('surfaces inputEnabled from the desktop-sources payload', async () => {
     const { client } = await connected();
     const seen: boolean[] = [];
