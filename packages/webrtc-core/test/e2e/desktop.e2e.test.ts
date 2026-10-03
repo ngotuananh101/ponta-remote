@@ -172,9 +172,12 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
   }
 
   /** The `inputEnabled` flag the agent last reported on `desktop-sources`. */
-  const inputEnabled = (frames: Array<DataChannelMessage<unknown>>): boolean | undefined => {
+  const inputEnabled = (
+    frames: Array<DataChannelMessage<unknown>>,
+  ): boolean | undefined => {
     const frame = frames.findLast((f) => f.type === 'desktop-sources');
-    return (frame?.payload as { inputEnabled?: boolean } | undefined)?.inputEnabled;
+    return (frame?.payload as { inputEnabled?: boolean } | undefined)
+      ?.inputEnabled;
   };
 
   /** Send one pointer-move at a known normalized point. */
@@ -468,12 +471,20 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
     });
 
     // No --allow-input: the default. RUST_LOG=debug so the drop is observable.
-    const agent = spawnAgent(agentId, credential, ['--desktop-source', 'test'], {
-      RUST_LOG: 'debug',
-    });
+    const agent = spawnAgent(
+      agentId,
+      credential,
+      ['--desktop-source', 'test'],
+      {
+        RUST_LOG: 'debug',
+      },
+    );
     await waitForAgentOnline(token, agentId);
 
-    const { offerer, packets, controlFrames } = await openDesktopPeer(sessionId, token);
+    const { offerer, packets, controlFrames } = await openDesktopPeer(
+      sessionId,
+      token,
+    );
     try {
       await waitFor(
         () => controlFrames.some((f) => f.type === 'desktop-sources'),
