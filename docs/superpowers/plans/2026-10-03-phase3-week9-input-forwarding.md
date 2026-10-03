@@ -52,12 +52,14 @@ The spec's §10.3 says "single PR, `feat/phase3-week9-input-forwarding`". The PM
 |---|---|---|---|---|
 | `feat/phase3-week9-input-web` | **D1 + D2 + D4** (sequential *within* the branch: shared → desktop-core → web) | FE | `packages/shared/**`, `packages/desktop-core/**`, `apps/web/**` | Same branch because the TS types are a compile-time dependency chain; splitting them would force a cross-branch wait for no benefit. |
 | `feat/phase3-week9-input-agent` | **D3** | BE | `apps/agent/**` | No file overlap with the FE branch. Independently buildable/testable; depends only on the **frozen wire shape** in § "Frozen interfaces" (not on the FE code landing). |
-| `test/phase3-week9-input-e2e` | **D5** | propose: whoever lands second (FE or BE) | `packages/webrtc-core/test/e2e/**` | Needs both the agent flag (D3) and the wire types (D1) present on the integration base — so it opens **after** the other two, on a branch cut from the merged `main`. |
-| `docs/phase3-week9-input-docs` | **D7 + D8** | propose: BE (owns the agent behaviour narrative) | `docs/**` only | Docs-only; independent of code. Can run in parallel with D5. |
+| `test/phase3-week9-input-e2e` | **D5** | **BE** (PM-decided) | `packages/webrtc-core/test/e2e/**`, `.github/workflows/ci-e2e.yml` | Needs both the agent flag (D3) and the wire types (D1) present on the integration base — so it opens **after** the other two, on a branch cut from the merged `main`. Owner is BE: the assertions are agent-behaviour (drop log, `xdotool` seat) and the §8.3 fallback seam (`test-injector`) is Rust-side. The earlier "whoever lands second" is dropped as nondeterministic. |
+| `docs/phase3-week9-input-docs` | **D7 + D8** | **BA** (PM-decided) | `docs/**` only | Docs-only; independent of code. Can run in parallel with D5. Owner is BA: the Task 7 text is already written and its cites verified at `b2bf167`; it balances load (BE already carries D3 + D5). The manual demo runs on an X11 host and is recorded honestly, including "not observed". |
 
 **Aggregation.** After the FE and BE branches merge, D5 and D7/D8 open against the updated `main`. If the team prefers a single PR after all (spec §10.3's literal wording), collapse FE+BE+D5+D8 into `feat/phase3-week9-input-forwarding` — the tasks below are written so either works; only the branch names in the `git push`/`gh pr create` steps change.
 
-**Spike (D6 / ADR-27)** is a **finding**, not a branch: it runs first, on the BE side, and its result is recorded in the Week 9 spec's ADR-27 before the D3 injector dependency is committed (Task 1 below).
+**Spike (D6 / ADR-27)** is a **finding**, not a branch: it runs first, on the BE side, and its result is recorded in the Week 9 spec's ADR-27 **before the D3 injector dependency is committed** (Task 1 below). That spec edit lands in **this** PR (`docs/phase3-week9-input-forwarding-plan`), so D3 is unblocked the moment it starts.
+
+**This plan's PR (BA).** The plan + the ADR-27 spec finding ship together in `docs/phase3-week9-input-forwarding-plan`; it is the prerequisite for the FE/BE/D5/D7 branches above.
 
 ### Breaking-change file list (the intentional `onSources` change)
 
@@ -159,7 +161,7 @@ Record a yes/no per criterion, with the exact command output that proves it:
 
 - [x] **Step 3: Record the finding in ADR-27 (replace the hypothesis with the result)**
 
-The finding was recorded in `### ADR-27` (spec `:158-169`). ADR-27 keeps **both** branches as the fallback contract; the observed result is appended — it is **not** promoted into an acceptance criterion (ADR-27's Consequence: §10.2 must not reference the spike). The recorded paragraph:
+The finding was recorded in `### ADR-27` (spec `:158-171`; the `**Finding**` paragraph lands at `:171`). ADR-27 keeps **both** branches as the fallback contract; the observed result is appended — it is **not** promoted into an acceptance criterion (ADR-27's Consequence: §10.2 must not reference the spike). The recorded paragraph:
 
 ```markdown
 **Finding (2026-10-03, half-day spike, Fedora + X11):** PASS — `enigo` 0.6.1 (MIT) builds with
@@ -177,7 +179,9 @@ Chosen branch: **enigo**. The per-platform branch stays documented above as the 
 
 Recorded: enigo consumes **physical** pixels on X11; `xcap` reports in the platform's native unit. §3.4 stays a **watch item** — `to_absolute` (Task 4) applies `scaleFactor` only if the concrete injector's unit differs. This is left open deliberately, not assumed correct.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
+
+Landed in this PR (`docs/phase3-week9-input-forwarding-plan`) — the finding is a prerequisite for D3 (Task 4), which must not commit the `enigo` dependency before ADR-27 records the observed result (see the note at `:60`). Committed as `docs(spec): record the ADR-27 injection-library spike finding (enigo)`.
 
 ```bash
 git add docs/superpowers/specs/2026-10-03-phase3-week9-input-forwarding-design.md
@@ -1209,7 +1213,8 @@ Declare the two locals before the `loop` in the dispatcher task (beside the Week
         // The injector is built lazily (first allowed input frame) and reused.
         let mut injector: Option<Box<dyn input::InputInjector>> = None;
         // The geometry `to_absolute` maps into. Week 9 uses the source the
-        // stream started on; a source swap updates this (see the note below).
+        // stream started on; a source swap does NOT update this in Week 9
+        // (deferred — see the note below). Do not extend scope to fix it here.
         let current_source = /* the resolved default source (clone) */;
 ```
 
@@ -1603,6 +1608,8 @@ In the `<template>`: attach the listeners to the `<video>` **conditionally** and
 
 > **Remove the stale comments.** `DesktopView.vue:71` (`<!-- No `controls`: Week 7 is view-only (ADR-18). -->`) and `:80` (`<!-- Control chrome (Week 8). No input forwarding: that is Week 9. -->`) are now wrong — the view is *conditionally* interactive (ADR-26 supersedes ADR-18). Replace them with a comment naming the gate. The `controls` attribute stays absent: the toggle is our own chrome, not the browser's.
 
+> **The `text` frame is wire-complete but has no web producer in Week 9 — deliberately.** The web listeners above cover pointer + `keydown`/`keyup` only (§7.2), which is the accepted Week 9 scope: ASCII/printable input reaches the agent through the `key` frames plus the agent-side `Key::Unicode` mapping (Task 4), so the `text` intent is redundant for plain typing. The `{ kind: 'text' }` frame stays in the shared union (Task 2), the agent decodes and injects it (Task 4, unit-tested), but **no web code emits it** — a real producer needs IME composition/preedit handling, which is a follow-up. The demo doc (**Task 7**) must state this plainly: `text` is agent-tested and wire-complete, **not** demoed end-to-end, and IME is **not** claimed.
+
 - [ ] **Step 8: Footer indicator in `WorkspaceView.vue`**
 
 The Week 8 media line is `:334-343`. Append the input indicator only when the tab reports it:
@@ -1764,6 +1771,14 @@ Both gate tests need to send a `desktop-input` frame and read the `desktop-sourc
 
 - [ ] **Step 4: Add the gate-open test (the injection path)**
 
+**Import first.** This test (and only this one) shells out to `xdotool`. `desktop.e2e.test.ts` does **not** yet import `node:child_process` — `harness.ts` does (`:1`), but that binding is not re-exported. Add at the top of `desktop.e2e.test.ts`, beside the existing imports:
+
+```typescript
+import { execFileSync } from 'node:child_process';
+```
+
+Then the test:
+
 ```typescript
   // Review Focus #1/#4, spec §8.3: with --allow-input, a pointer-move reaches
   // the real seat. Asserted via `xdotool` (XTest under Xvfb), NEVER via enigo's
@@ -1791,19 +1806,27 @@ Both gate tests need to send a `desktop-input` frame and read the `desktop-sourc
       );
       expect(inputEnabled(controlFrames)).toBe(true);
 
-      // Move the seat somewhere known, then forward a normalized point that
-      // maps to a different spot and read the OS pointer back.
+      // Pin the seat to a known origin FIRST. Xvfb's pointer starts at the
+      // screen centre (spike: x:960 y:540 on 1920x1080), so a bare
+      // "did it leave the origin?" assert would pass even if the injector did
+      // nothing — a false green on the one test that proves real injection.
+      execFileSync('xdotool', ['mousemove', '0', '0']);
+
+      // Forward a normalized point and assert the EXACT mapped pixel, not just
+      // "somewhere". The `test` source is 1280x720 at origin 0,0, so
+      // to_absolute(0.25, 0.25) = (round(0.25*1280), round(0.25*720)) =
+      // (320, 180). A small tolerance absorbs X11 pointer rounding.
+      const [wantX, wantY] = [320, 180];
       sendPointerMove(offerer, 0.25, 0.25);
       await waitFor(
         () => {
           const out = execFileSync('xdotool', ['getmouselocation']).toString();
-          // `xdotool getmouselocation` prints `x:NNN y:NNN ...`; assert it left
-          // the origin — the exact pixel depends on the Xvfb screen size.
+          // `xdotool getmouselocation` prints `x:NNN y:NNN ...`.
           const x = Number(/x:(\d+)/.exec(out)?.[1]);
           const y = Number(/y:(\d+)/.exec(out)?.[1]);
-          return x > 0 || y > 0;
+          return Math.abs(x - wantX) <= 2 && Math.abs(y - wantY) <= 2;
         },
-        'the OS pointer to move',
+        `the OS pointer to land near (${wantX}, ${wantY})`,
         15_000,
       );
     } finally {
@@ -1811,6 +1834,10 @@ Both gate tests need to send a `desktop-input` frame and read the `desktop-sourc
     }
   }, 120_000);
 ```
+
+> **Why the exact point, not "moved".** Warping to `0,0` then asserting `320,180` proves the *whole* pipeline — normalized intent → `to_absolute` → enigo → XTest → the real X seat. Asserting only "left the origin" cannot distinguish a correct map from a wrong one (e.g. a transposed axis or an off-by-scale error would still leave `0,0`). The `test` source's `x/y = 0` and `scaleFactor = 1.0` make `320,180` the exact expected pixel.
+>
+> **Local X11 caveat.** Run on a real X session (not Xvfb), this test warps the operator's actual pointer to `0,0` and then `320,180`. That is acceptable for an E2E that must prove real-seat injection; it runs by default only in the CI job (Step 5) and locally only when the operator runs `test:e2e` deliberately.
 
 > **The §8.3 fallback, if XTest is unavailable under CI's Xvfb (spec §3.5, §8.3).** If `xdotool`/XTest cannot drive the seat, the test asserts the **injector call** instead, via a test-only seam: gate the `PlatformInjector` behind `#[cfg(feature = "test-injector")]` with a `CountingInjector`, expose the count on a debug line, and assert it. Record in the PR body **which** path was taken. Real-seat injection is then covered by the manual demo (Task 7). This is a stated, bounded trade-off — not a silent skip. The gate-closed test (Step 3) is unaffected either way.
 
@@ -1969,6 +1996,15 @@ result.>
 
 <Any deviation; the `current_source`-after-swap limitation (Task 4, Step 7b);
 the `scaleFactor` watch item (spec §3.4).>
+
+## Scope notes (state these — do not overclaim)
+
+- **`text` frame:** wire-complete and agent-tested (Task 4), but **no web producer
+  in Week 9** — printable ASCII reaches the agent via `key` frames + the
+  agent-side `Key::Unicode` mapping. So typing is demoed through `key` frames;
+  the `text` path is **not** exercised end-to-end here.
+- **IME / composition:** **not** implemented and **not** claimed. A real `text`
+  producer needs IME preedit handling — a follow-up.
 ```
 
 - [ ] **Step 8: Confirm every acceptance criterion (spec §10.2)**
