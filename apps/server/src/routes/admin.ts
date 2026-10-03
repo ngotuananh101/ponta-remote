@@ -241,20 +241,38 @@ admin.patch('/users/:id', async (c) => {
 
   // Safety: cannot demote the last active admin.
   if (updates.role === 'user' && target.role === 'admin' && target.isActive) {
-    const activeAdminsRow = await db
-      .select({ value: count() })
-      .from(users)
-      .where(and(eq(users.role, 'admin'), eq(users.isActive, true)))
-      .get();
+    const updated = db.transaction((tx) => {
+      const activeAdminsRow = tx
+        .select({ value: count() })
+        .from(users)
+        .where(and(eq(users.role, 'admin'), eq(users.isActive, true)))
+        .get();
 
-    const activeAdmins = activeAdminsRow?.value ?? 0;
-    if (activeAdmins <= 1) {
-      throw new AppError(
-        'Cannot demote the only active admin',
-        400,
-        'LAST_ADMIN_PROTECTED',
-      );
+      const activeAdmins = activeAdminsRow?.value ?? 0;
+      if (activeAdmins <= 1) {
+        throw new AppError(
+          'Cannot demote the only active admin',
+          400,
+          'LAST_ADMIN_PROTECTED',
+        );
+      }
+
+      updates.updatedAt = new Date().toISOString();
+      const [result] = tx
+        .update(users)
+        .set(updates)
+        .where(eq(users.id, targetId))
+        .returning()
+        .all();
+
+      return result;
+    });
+
+    if (!updated) {
+      throw new AppError('User not found', 404, 'NOT_FOUND');
     }
+
+    return c.json({ user: toPublicUser(updated) });
   }
 
   updates.updatedAt = new Date().toISOString();
