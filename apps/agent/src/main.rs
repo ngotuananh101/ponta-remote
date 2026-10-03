@@ -85,6 +85,11 @@ struct Cli {
     /// source id validated against the enumeration at startup.
     #[arg(long, env = "AGENT_DESKTOP_DEFAULT_SOURCE", default_value = "primary")]
     desktop_default_source: String,
+
+    /// Bounded window to apply a requested source switch before keeping the
+    /// current source (ADR-22).
+    #[arg(long, env = "AGENT_DESKTOP_SELECT_TIMEOUT_MS", default_value_t = 5000)]
+    desktop_select_timeout_ms: u64,
 }
 
 /// `--credential-or-env` in the roadmap is realised as clap's
@@ -381,6 +386,10 @@ struct SessionConfig {
     /// Unused on musl for the same reason as `desktop_profile`.
     #[allow(dead_code)]
     desktop_default_source: String,
+    /// Unused on musl (the desktop module is compiled out); same shape on every
+    /// target, mirroring `desktop_source`.
+    #[allow(dead_code)]
+    desktop_select_timeout: Duration,
 }
 
 /// Connect, serve, and reconnect with exponential backoff until told to stop.
@@ -433,6 +442,7 @@ async fn run_with_reconnect(cli: &Cli, credential: &str, shell: &str) -> Result<
         desktop_source: cli.desktop_source,
         desktop_profile,
         desktop_default_source: cli.desktop_default_source.clone(),
+        desktop_select_timeout: Duration::from_millis(cli.desktop_select_timeout_ms),
     };
 
     let mut delay = signal::BACKOFF_INITIAL;
@@ -1305,6 +1315,8 @@ async fn run_desktop_session(
         ssrc,
         payload_type,
         cfg.desktop_profile,
+        cfg.desktop_source == DesktopSource::Test,
+        cfg.desktop_select_timeout,
         control_rx,
         events_tx,
         stop_rx,

@@ -736,6 +736,106 @@ fn frame_content(frame: &RawFrame) -> (f64, [f64; 3]) {
     )
 }
 
+/// How long a requested source switch may take before the agent gives up and
+/// keeps the current source (ADR-22; env `AGENT_DESKTOP_SELECT_TIMEOUT_MS`).
+///
+/// The CLI default in `main.rs` is the same 5000 ms, spelled as a literal
+/// because this module is compiled out on musl and so cannot be its source.
+/// The constant is the value the swap tests drive `swap_source` with; the
+/// non-test build passes the resolved `cfg.desktop_select_timeout` instead.
+#[allow(dead_code)]
+pub const DEFAULT_SELECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The two source-factory operations a swap needs, behind a seam.
+///
+/// `enumerate_sources`/`source_for` touch a live display, so a unit test cannot
+/// drive the real swap. This trait lets the test inject a fake enumeration and
+/// a fake factory while `swap_source` — the ordering, the bound, the leak
+/// discipline — stays the production code path.
+///
+/// `build` is async (it awaits `source_for`'s first-frame handshake), so the
+/// trait carries `#[async_trait::async_trait]` — the same pattern `rtc.rs` uses
+/// for `PeerConnectionEventHandler`. A bare `async fn` in a public trait would
+/// also trip the warn-by-default `async_fn_in_trait` lint under `-D warnings`.
+#[async_trait::async_trait]
+pub trait SwapSource {
+    /// The ids the agent is willing to switch to. A requested id not in this
+    /// list is refused (spec §9).
+    fn source_ids(&self) -> Vec<String>;
+    /// Build the source for an id already validated by `source_ids`.
+    async fn build(&self, id: &str) -> Result<Box<dyn FrameSource>>;
+}
+
+/// The production `SwapSource`: `xcap` enumeration on a real host, the single
+/// synthetic entry under `--desktop-source test` (so a swap in test mode can
+/// only ever re-select the test pattern).
+pub struct LiveSources {
+    pub test: bool,
+}
+
+#[async_trait::async_trait]
+impl SwapSource for LiveSources {
+    fn source_ids(&self) -> Vec<String> {
+        if self.test {
+            return vec![test_source_info().id];
+        }
+        enumerate_sources()
+            .map(|sources| sources.into_iter().map(|s| s.id).collect())
+            .unwrap_or_default()
+    }
+
+    async fn build(&self, id: &str) -> Result<Box<dyn FrameSource>> {
+        // One factory for every path: `source_for` already handles the `test:`
+        // scheme, so the test branch needs no special case here. `source_ids`
+        // gates what can reach this, so in test mode `id` is always `test:0`.
+        source_for(id, StreamProfile::DEFAULT_1080P30).await
+    }
+}
+
+/// Build a replacement source + encoder, or fail without disturbing the live
+/// one (ADR-22, spec §6.4).
+///
+/// Takes the current source by `&mut` and returns the new encoder; the current
+/// source is stopped (and left in place) only when the new one is fully built,
+/// so a failure here is a no-op on the running stream. The id is validated
+/// against `sources.source_ids()` **before** `build`, so the factory never sees
+/// an unenumerated id.
+///
+/// Returning the encoder (rather than both sources) is what lets the caller's
+/// `Err` arm keep streaming on the current source: the caller owns `current`
+/// and never moved it into this call.
+async fn swap_source<S: SwapSource>(
+    current: &mut Box<dyn FrameSource>,
+    sources: &S,
+    id: &str,
+    profile: StreamProfile,
+    timeout: Duration,
+) -> Result<DesktopEncoder> {
+    if !sources.source_ids().iter().any(|known| known == id) {
+        bail!("unknown source id {id:?}");
+    }
+
+    // The build is the only part that can hang (a portal that never answers), so
+    // it is the part that is bounded. On timeout the half-built source — if any
+    // — is dropped inside the future, and `current` is still the live one.
+    let built = tokio::time::timeout(timeout, async {
+        let source = sources.build(id).await?;
+        let encoder = DesktopEncoder::new(profile)?;
+        Ok::<_, anyhow::Error>((source, encoder))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("source {id:?} did not start within {timeout:?}"))??;
+
+    // Success: the new source is live, so the old one is stopped now — never
+    // before, so a failed swap leaks nothing and kills nothing. `stop` is
+    // explicit because `FrameSource`'s contract is a method, not `Drop`
+    // (`ScreenSource`/`WindowSource` do not implement `Drop`).
+    current.stop();
+    let (new_source, encoder) = built;
+    *current = new_source;
+    Ok(encoder)
+}
+
 /// Encodes frames as they arrive and writes each as one media sample.
 ///
 /// Runs until `stop` flips to `true` (checked before the first tick and after
@@ -746,10 +846,11 @@ fn frame_content(frame: &RawFrame) -> (f64, [f64; 3]) {
 ///
 /// `ssrc`/`payload_type` are resolved by the caller from the negotiated sender
 /// (§6.3) and are never hardcoded.
-// Eight parameters: source, track, ssrc, payload type, profile, the control
-// receiver, the events sender, and the stop signal. They are the loop's whole
-// input surface; bundling them into a struct would only move the same fields
-// behind one more name. `run_desktop_session` carries the same allow.
+// Ten parameters: source, track, ssrc, payload type, profile, whether the
+// session runs the test source, the swap timeout, the control receiver, the
+// events sender, and the stop signal. They are the loop's whole input surface;
+// bundling them into a struct would only move the same fields behind one more
+// name. `run_desktop_session` carries the same allow.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_stream(
     mut source: Box<dyn FrameSource>,
@@ -757,6 +858,8 @@ pub async fn run_stream(
     ssrc: SSRC,
     payload_type: PayloadType,
     mut profile: StreamProfile,
+    source_is_test: bool,
+    select_timeout: Duration,
     mut control: tokio::sync::mpsc::Receiver<StreamControl>,
     events: tokio::sync::mpsc::Sender<StreamEvent>,
     mut stop: watch::Receiver<bool>,
@@ -816,8 +919,37 @@ pub async fn run_stream(
                         }
                     }
                     Some(StreamControl::SourceSwap(id)) => {
-                        // Task 4c implements this arm.
-                        tracing::debug!(source_id = %id, "desktop: source-swap command received");
+                        match swap_source(
+                            &mut source,
+                            &LiveSources { test: source_is_test },
+                            &id,
+                            profile,
+                            select_timeout,
+                        )
+                        .await
+                        {
+                            Ok(new_encoder) => {
+                                encoder = new_encoder;
+                                // The new source may be a different size; the UI
+                                // learns it from the next stats frame.
+                                encoded_size = (profile.max_width, profile.max_height);
+                                send_stats(&events, encoded_size, profile, None);
+                            }
+                            Err(e) => {
+                                // The stream keeps running on the current source
+                                // (ADR-22). Tell the UI, per spec §2.2.
+                                tracing::warn!(source_id = %id, error = %e, "desktop: source swap refused");
+                                send_stats(
+                                    &events,
+                                    encoded_size,
+                                    profile,
+                                    Some(StatsStatus {
+                                        kind: StatsStatusKind::SelectRefused,
+                                        detail: format!("could not switch source: {e}"),
+                                    }),
+                                );
+                            }
+                        }
                     }
                     None => control_closed = true,
                 }
@@ -1594,6 +1726,8 @@ mod tests {
             1234,
             96,
             StreamProfile::SAFE_720P30,
+            false,
+            DEFAULT_SELECT_TIMEOUT,
             control_rx,
             events_tx,
             stop_rx,
@@ -1627,6 +1761,8 @@ mod tests {
                 1234,
                 96,
                 StreamProfile::SAFE_720P30,
+                false,
+                DEFAULT_SELECT_TIMEOUT,
                 control_rx,
                 events_tx,
                 stop_rx,
@@ -1953,5 +2089,162 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&frame_desktop_stats(&stats, 1)).unwrap();
         assert!(value["payload"].get("status").is_none());
+    }
+
+    /// A `FrameSource` that records how often it was stopped.
+    struct FakeSource {
+        stopped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl FrameSource for FakeSource {
+        fn next_frame(&mut self) -> Result<Option<RawFrame>> {
+            Ok(None)
+        }
+        fn stop(&mut self) {
+            self.stopped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A `SwapSource` whose enumeration and factory the test controls.
+    struct FakeSources {
+        ids: Vec<String>,
+        fail: bool,
+        hang: bool,
+    }
+    #[async_trait::async_trait]
+    impl SwapSource for FakeSources {
+        fn source_ids(&self) -> Vec<String> {
+            self.ids.clone()
+        }
+        async fn build(&self, _id: &str) -> Result<Box<dyn FrameSource>> {
+            if self.hang {
+                // An async wait, NOT a blocking sleep: `tokio::time::timeout`
+                // only fires if the runtime keeps driving the timer, and a
+                // blocking sleep inside the polled future would block the very
+                // thread the timer needs (a current-thread runtime would
+                // deadlock, and the test would hang forever instead of failing).
+                // An `await` yields the worker, so the timer fires — exactly the
+                // async-friendly hang the bound exists for (a portal that
+                // accepts the request and never answers, like `source_for`'s
+                // `ready_rx.await`). The plan's `std::thread::sleep` here cannot
+                // be preempted; see the ledger ruling.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            if self.fail {
+                bail!("the fake source refused to start");
+            }
+            Ok(Box::new(FakeSource {
+                stopped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swap_source_stops_the_old_source_only_after_the_new_one_is_built() {
+        let stopped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut current: Box<dyn FrameSource> = Box::new(FakeSource {
+            stopped: stopped.clone(),
+        });
+        let sources = FakeSources {
+            ids: vec!["monitor:1".to_string()],
+            fail: false,
+            hang: false,
+        };
+
+        let _encoder = swap_source(
+            &mut current,
+            &sources,
+            "monitor:1",
+            StreamProfile::SAFE_720P30,
+            DEFAULT_SELECT_TIMEOUT,
+        )
+        .await
+        .expect("a valid swap");
+
+        assert_eq!(stopped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swap_source_refuses_an_unenumerated_id_without_touching_the_current_source() {
+        let stopped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut current: Box<dyn FrameSource> = Box::new(FakeSource {
+            stopped: stopped.clone(),
+        });
+        let sources = FakeSources {
+            ids: vec!["monitor:1".to_string()],
+            fail: false,
+            hang: false,
+        };
+
+        let result = swap_source(
+            &mut current,
+            &sources,
+            "monitor:999999",
+            StreamProfile::SAFE_720P30,
+            DEFAULT_SELECT_TIMEOUT,
+        )
+        .await;
+
+        assert!(result.is_err(), "an unenumerated id must be refused");
+        assert_eq!(stopped.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swap_source_keeps_the_current_source_when_the_new_one_fails_to_start() {
+        let stopped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut current: Box<dyn FrameSource> = Box::new(FakeSource {
+            stopped: stopped.clone(),
+        });
+        let sources = FakeSources {
+            ids: vec!["monitor:1".to_string()],
+            fail: true,
+            hang: false,
+        };
+
+        let result = swap_source(
+            &mut current,
+            &sources,
+            "monitor:1",
+            StreamProfile::SAFE_720P30,
+            DEFAULT_SELECT_TIMEOUT,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            stopped.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a failed swap must not stop the live source"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swap_source_gives_up_on_a_slow_build_within_the_bound() {
+        let stopped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut current: Box<dyn FrameSource> = Box::new(FakeSource {
+            stopped: stopped.clone(),
+        });
+        let sources = FakeSources {
+            ids: vec!["monitor:1".to_string()],
+            fail: false,
+            hang: true,
+        };
+
+        let started = std::time::Instant::now();
+        let result = swap_source(
+            &mut current,
+            &sources,
+            "monitor:1",
+            StreamProfile::SAFE_720P30,
+            Duration::from_millis(200),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the swap must be bounded by the timeout, not the build"
+        );
+        assert_eq!(stopped.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
