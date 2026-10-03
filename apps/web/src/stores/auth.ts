@@ -83,6 +83,14 @@ export const useAuthStore = defineStore('auth', () => {
         publicKey: keyPair.publicKeySpkiBase64,
       });
 
+      if (res.requiresApproval) {
+        status.value = 'idle';
+        user.value = null;
+        error.value =
+          'Your account is pending admin approval. You will be notified once approved.';
+        return;
+      }
+
       await savePrivateKey(res.user.id, keyPair.privateKey);
 
       user.value = res.user;
