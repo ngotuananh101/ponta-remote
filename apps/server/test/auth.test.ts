@@ -46,6 +46,7 @@ describe('Auth & Users REST API', () => {
   let db: Database;
 
   beforeEach(async () => {
+    closeDb();
     db = getDb(':memory:');
   });
 

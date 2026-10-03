@@ -59,6 +59,8 @@ auth.post('/register', async (c) => {
   // Trim before validating so a username of only whitespace cannot slip past
   // the length check, and so uniqueness compares the stored value exactly.
   const username = body.username.trim();
+  const publicKey = body.publicKey;
+  const password = body.password;
 
   if (username.length < MIN_USERNAME_LENGTH) {
     throw new AppError(
@@ -68,7 +70,7 @@ auth.post('/register', async (c) => {
     );
   }
 
-  if (body.password.length < MIN_PASSWORD_LENGTH) {
+  if (password.length < MIN_PASSWORD_LENGTH) {
     throw new AppError(
       'Password must be at least 8 characters',
       400,
@@ -106,42 +108,56 @@ auth.post('/register', async (c) => {
     throw new AppError('Email already registered', 409, 'EMAIL_EXISTS');
   }
 
-  const passwordHash = await hashPassword(body.password);
-  const userId = crypto.randomUUID();
+  const passwordHash = await hashPassword(password);
 
   // Bootstrap logic: the very first registered user becomes an approved admin;
   // every subsequent user is a regular user whose approval status is governed by
   // the `autoApproveUsers` setting (default: pending manual approval).
-  const userCountRow = await db.select({ value: count() }).from(users).get();
-  const isFirstUser = userCountRow?.value === 0;
+  //
+  // The count check and insert are wrapped in a transaction so that concurrent
+  // registrations cannot both observe zero users and both bootstrap as admin.
+  // better-sqlite3 transactions are synchronous and SQLite acquires an exclusive
+  // write lock, making this race-free.
+  const { newUser, approvalStatus } = db.transaction((tx) => {
+    const userCountRow = tx
+      .select({ value: count() })
+      .from(users)
+      .get();
+    const isFirstUser = userCountRow?.value === 0;
 
-  let role: 'admin' | 'user';
-  let approvalStatus: 'pending' | 'approved' | 'rejected';
-  if (isFirstUser) {
-    role = 'admin';
-    approvalStatus = 'approved';
-  } else {
-    role = 'user';
-    approvalStatus = settings.autoApproveUsers ? 'approved' : 'pending';
-  }
+    let role: 'admin' | 'user';
+    let status: 'pending' | 'approved' | 'rejected';
+    if (isFirstUser) {
+      role = 'admin';
+      status = 'approved';
+    } else {
+      role = 'user';
+      status = settings.autoApproveUsers ? 'approved' : 'pending';
+    }
 
-  const [newUser] = await db
-    .insert(users)
-    .values({
-      id: userId,
-      username,
-      email: body.email ?? null,
-      publicKey: body.publicKey,
-      passwordHash,
-      isActive: true,
-      role,
-      approvalStatus,
-    })
-    .returning();
+    // In a sync transaction, `.returning()` yields a QueryPromise that cannot
+    // be awaited; `.all()` executes it synchronously and returns the result rows.
+    const createdResults = tx
+      .insert(users)
+      .values({
+        username,
+        email: body.email ? body.email : null,
+        publicKey,
+        passwordHash,
+        isActive: true,
+        role,
+        approvalStatus: status,
+      })
+      .returning()
+      .all();
+    const created = createdResults[0];
 
-  if (!newUser) {
-    throw new AppError('Failed to create user', 500, 'DATABASE_ERROR');
-  }
+    if (!created) {
+      throw new AppError('Failed to create user', 500, 'DATABASE_ERROR');
+    }
+
+    return { newUser: created, approvalStatus: status };
+  });
 
   // Pending users cannot receive tokens — they must wait for admin approval.
   if (approvalStatus === 'pending') {

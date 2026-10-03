@@ -123,4 +123,37 @@ describe('Auth Approval & Registration Gate', () => {
     const err = await res.json();
     expect(err.code).toBe('REGISTRATION_DISABLED');
   });
+
+  it('registers second user as approved with tokens when autoApproveUsers is true', async () => {
+    const app = createApp();
+    // 1. First user (admin)
+    await app.request('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'admin',
+        password: 'Password123!',
+        publicKey: 'pk_admin',
+      }),
+    });
+    // 2. Enable autoApproveUsers
+    await updateSystemSettings(db, { autoApproveUsers: true });
+    // 3. Second user
+    const res = await app.request('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'auto_approved',
+        password: 'Password123!',
+        publicKey: 'pk_auto',
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.user.role).toBe('user');
+    expect(body.user.approvalStatus).toBe('approved');
+    expect(body.token).toBeDefined();
+    expect(body.requiresApproval).toBe(false);
+  });
 });
