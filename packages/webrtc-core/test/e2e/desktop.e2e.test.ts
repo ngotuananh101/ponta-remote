@@ -140,6 +140,36 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
     return { offerer, tracks, packets, controlFrames };
   }
 
+  /**
+   * Seed a desktop session, spawn the agent against the deterministic test
+   * source (ADR-17), open a control-carrying peer, and expose the received
+   * `desktop-stats` frames as a lazy view. The control tests share this whole
+   * prologue; keeping it in one place is what keeps them readable (and keeps
+   * their bodies from being flagged as duplicate code).
+   */
+  async function openTestDesktopStream(): Promise<{
+    offerer: PeerConnection;
+    packets: RtpPacket[];
+    controlFrames: Array<DataChannelMessage<unknown>>;
+    stats: () => DesktopStats[];
+  }> {
+    const { token, agentId, credential, sessionId } = await seed({
+      capabilities: ['desktop'],
+    });
+    spawnAgent(agentId, credential, ['--desktop-source', 'test']);
+    await waitForAgentOnline(token, agentId);
+
+    const { offerer, packets, controlFrames } = await openDesktopPeer(
+      sessionId,
+      token,
+    );
+    const stats = (): DesktopStats[] =>
+      controlFrames
+        .filter((f) => f.type === 'desktop-stats')
+        .map((f) => f.payload as DesktopStats);
+    return { offerer, packets, controlFrames, stats };
+  }
+
   it('receives a real H.264 track with flowing RTP', async () => {
     const { token, agentId, credential, sessionId } = await seed({
       capabilities: ['desktop'],
@@ -253,14 +283,7 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
   // Review Focus: the control channel is the new inbound surface, so the first
   // thing to pin is that it opens and the agent enumerates onto it (spec §8.3).
   it('opens a control channel and enumerates the default test source', async () => {
-    const { token, agentId, credential, sessionId } = await seed({
-      capabilities: ['desktop'],
-    });
-
-    spawnAgent(agentId, credential, ['--desktop-source', 'test']);
-    await waitForAgentOnline(token, agentId);
-
-    const { offerer, controlFrames } = await openDesktopPeer(sessionId, token);
+    const { offerer, controlFrames } = await openTestDesktopStream();
     try {
       await waitFor(
         () => controlFrames.some((f) => f.type === 'desktop-sources'),
@@ -291,18 +314,7 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
   // The wire path and the stats echo, not the encoder internals (those are
   // Rust unit tests, Task 4b). Pins spec §2.3 step 6.
   it('applies a manual bitrate and reflects it in a later desktop-stats', async () => {
-    const { token, agentId, credential, sessionId } = await seed({
-      capabilities: ['desktop'],
-    });
-
-    spawnAgent(agentId, credential, ['--desktop-source', 'test']);
-    await waitForAgentOnline(token, agentId);
-
-    const { offerer, controlFrames } = await openDesktopPeer(sessionId, token);
-    const stats = (): DesktopStats[] =>
-      controlFrames
-        .filter((f) => f.type === 'desktop-stats')
-        .map((f) => f.payload as DesktopStats);
+    const { offerer, stats } = await openTestDesktopStream();
 
     try {
       // The stream emits a first `desktop-stats` on its first encoded frame.
@@ -331,17 +343,7 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
   // `desktop-stats` — never as a dedicated error frame, and never as a source
   // the agent did not enumerate (spec §9).
   it('refuses an unknown desktop-select and keeps streaming', async () => {
-    const { token, agentId, credential, sessionId } = await seed({
-      capabilities: ['desktop'],
-    });
-
-    spawnAgent(agentId, credential, ['--desktop-source', 'test']);
-    await waitForAgentOnline(token, agentId);
-
-    const { offerer, packets, controlFrames } = await openDesktopPeer(
-      sessionId,
-      token,
-    );
+    const { offerer, packets, controlFrames } = await openTestDesktopStream();
     try {
       await waitFor(
         () => controlFrames.some((f) => f.type === 'desktop-sources'),
@@ -381,18 +383,7 @@ describe.skipIf(!isLinux)('cross-language desktop E2E', () => {
   // under the 1080p30 default box (1920×1080) — the UI must be told the former.
   // Re-selecting the only test source is a real (non-refused) swap (ADR-22).
   it('reports the real frame size after a source swap, not the profile box', async () => {
-    const { token, agentId, credential, sessionId } = await seed({
-      capabilities: ['desktop'],
-    });
-
-    spawnAgent(agentId, credential, ['--desktop-source', 'test']);
-    await waitForAgentOnline(token, agentId);
-
-    const { offerer, controlFrames } = await openDesktopPeer(sessionId, token);
-    const stats = (): DesktopStats[] =>
-      controlFrames
-        .filter((f) => f.type === 'desktop-stats')
-        .map((f) => f.payload as DesktopStats);
+    const { offerer, stats } = await openTestDesktopStream();
 
     try {
       await waitFor(
