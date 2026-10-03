@@ -18,7 +18,10 @@ function mockPeer() {
   let trackHandler:
     ((t: MediaStreamTrackLike, s: MediaStreamLike[]) => void) | null = null;
   let stateHandler: ((state: string) => void) | null = null;
-  let controlOpen = false;
+  // The registered channel's readyState, or `null` when the label is absent.
+  // Mirrors the real manager: an offerer pre-creates the channel, so it is
+  // *registered* (hasChannel true) while still `connecting`.
+  let controlState: 'connecting' | 'open' | 'closed' | null = 'connecting';
   let controlHandler: ((msg: unknown) => void) | null = null;
   const removeTrackHandler = vi.fn();
   const removeStateHandler = vi.fn();
@@ -46,7 +49,12 @@ function mockPeer() {
         return removeStateHandler;
       }),
       dataChannels: {
-        hasChannel: vi.fn((_label: string) => controlOpen),
+        hasChannel: vi.fn((_label: string) => controlState !== null),
+        getChannel: vi.fn((_label: string) =>
+          controlState === null
+            ? undefined
+            : { label: 'control', readyState: controlState },
+        ),
         onMessage: vi.fn((_label: string, handler: (msg: unknown) => void) => {
           controlHandler = handler;
           return removeControlHandler;
@@ -63,7 +71,10 @@ function mockPeer() {
     emitState: (state: string) => stateHandler?.(state),
     emitControl: (msg: unknown) => controlHandler?.(msg),
     setControlOpen: (open: boolean) => {
-      controlOpen = open;
+      controlState = open ? 'open' : null;
+    },
+    setControlState: (state: 'connecting' | 'open' | 'closed' | null) => {
+      controlState = state;
     },
     sendJson,
     waitForChannel,
@@ -270,6 +281,80 @@ describe('DesktopClient control surface', () => {
     client.close();
   });
 
+  // The agent pushes `desktop-sources` as soon as the control channel opens —
+  // which can be before the store registers its listener. Without a replay the
+  // picker stays empty forever, so the last frame must be cached and replayed.
+  it('replays the last desktop-sources frame to a late listener', async () => {
+    const { client, emitControl } = await connected();
+    emitControl({
+      type: 'desktop-sources',
+      channel: 'control',
+      payload: { sources: [oneSource] },
+      timestamp: 1,
+    });
+
+    const seen: unknown[] = [];
+    client.onSources((sources) => seen.push(sources));
+
+    expect(seen).toEqual([[oneSource]]);
+    client.close();
+  });
+
+  it('replays the last desktop-stats frame to a late listener', async () => {
+    const { client, emitControl } = await connected();
+    emitControl({
+      type: 'desktop-stats',
+      channel: 'control',
+      payload: {
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        targetBitrateBps: 6_000_000,
+      },
+      timestamp: 1,
+    });
+
+    const seen: unknown[] = [];
+    client.onStats((stats) => seen.push(stats));
+
+    expect(seen).toEqual([
+      { width: 1920, height: 1080, fps: 30, targetBitrateBps: 6_000_000 },
+    ]);
+    client.close();
+  });
+
+  it('does not replay to a listener registered before any frame', async () => {
+    const { client } = await connected();
+    const seen: unknown[] = [];
+    client.onSources((sources) => seen.push(sources));
+
+    // Nothing cached yet: subscribing is not itself an event.
+    expect(seen).toEqual([]);
+    client.close();
+  });
+
+  it('drops a malformed desktop-stats frame instead of forwarding NaN', async () => {
+    const { client, emitControl } = await connected();
+    const seen: unknown[] = [];
+    client.onStats((stats) => seen.push(stats));
+
+    emitControl({
+      type: 'desktop-stats',
+      channel: 'control',
+      payload: { width: 1280 },
+      timestamp: 1,
+    });
+    emitControl({
+      type: 'desktop-stats',
+      channel: 'control',
+      payload: null,
+      timestamp: 2,
+    });
+
+    expect(seen).toEqual([]);
+    client.close();
+  });
+
   it('ignores an unknown control type without error', async () => {
     const { client, emitControl } = await connected();
     const sources: unknown[] = [];
@@ -288,8 +373,8 @@ describe('DesktopClient control surface', () => {
   });
 
   it('selectSource sends a desktop-select frame when the channel is open', async () => {
-    const { client, sendJson, setControlOpen } = await connected();
-    setControlOpen(true);
+    const { client, sendJson, setControlState } = await connected();
+    setControlState('open');
 
     client.selectSource('window:0x4a00007');
 
@@ -300,8 +385,8 @@ describe('DesktopClient control surface', () => {
   });
 
   it('setBitrate sends a desktop-bitrate frame when the channel is open', async () => {
-    const { client, sendJson, setControlOpen } = await connected();
-    setControlOpen(true);
+    const { client, sendJson, setControlState } = await connected();
+    setControlState('open');
 
     client.setBitrate(2_500_000);
 
@@ -312,8 +397,26 @@ describe('DesktopClient control surface', () => {
   });
 
   it('selectSource and setBitrate warn instead of throwing when the channel is absent', async () => {
-    const { client, sendJson, setControlOpen } = await connected();
-    setControlOpen(false);
+    const { client, sendJson, setControlState } = await connected();
+    setControlState(null);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(() => client.selectSource('monitor:1')).not.toThrow();
+    expect(() => client.setBitrate(1_000_000)).not.toThrow();
+    expect(sendJson).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+
+    warn.mockRestore();
+    client.close();
+  });
+
+  // The offerer pre-creates the channel in the constructor, so `hasChannel` is
+  // true from the start even while the channel is still `connecting`. Sending
+  // then throws InvalidStateError inside RTCDataChannel.send(), so the guard
+  // must test readyState, not mere registration.
+  it('selectSource and setBitrate warn while the channel is still connecting', async () => {
+    const { client, sendJson, setControlState } = await connected();
+    setControlState('connecting');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     expect(() => client.selectSource('monitor:1')).not.toThrow();

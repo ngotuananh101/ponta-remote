@@ -191,19 +191,43 @@ describe('DesktopView', () => {
     expect(setBitrate).toHaveBeenCalledWith('tab-1', 3_000_000);
   });
 
-  it('keeps the video view-only: no controls, no input handlers', () => {
+  it('keeps the video view-only: no controls, no input forwarding', async () => {
+    const store = useTerminalStore();
+    const select = vi
+      .spyOn(store, 'selectDesktopSource')
+      .mockImplementation(() => {});
+    const setBitrate = vi
+      .spyOn(store, 'setDesktopBitrate')
+      .mockImplementation(() => {});
     const wrapper = mount(DesktopView, {
       props: {
         tab: desktopTab({
           desktopSources: twoSources,
           desktopSourceId: 'monitor:1',
+          desktopStats: {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            targetBitrateBps: 6_000_000,
+          },
         }),
       },
     });
     const video = wrapper.find('video');
-    // Review Focus #3: control chrome must not turn the video interactive.
     expect(video.attributes('controls')).toBeUndefined();
-    expect(video.attributes('onmousedown')).toBeUndefined();
-    expect(video.attributes('onkeydown')).toBeUndefined();
+
+    // Week 9 owns input forwarding. Asserting the *absence* of a rendered
+    // `onmousedown` attribute is vacuous — Vue attaches listeners via
+    // addEventListener and never renders them as attributes, so that check
+    // passes even with a handler attached. Dispatch the real events instead and
+    // prove nothing is forwarded: this fails if any pointer/key handler is
+    // wired to the video.
+    await video.trigger('mousedown');
+    await video.trigger('mouseup');
+    await video.trigger('click');
+    await video.trigger('keydown');
+
+    expect(select).not.toHaveBeenCalled();
+    expect(setBitrate).not.toHaveBeenCalled();
   });
 });

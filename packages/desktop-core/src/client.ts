@@ -21,6 +21,14 @@ export class DesktopClient {
   private readonly statsListeners: Array<(stats: DesktopStats) => void> = [];
   private closed = false;
   private started = false;
+  /**
+   * Last control frame per kind, cached even with no listener attached. The
+   * agent pushes `desktop-sources` once the control channel opens, which can
+   * beat the store's listener registration; without a cache that frame would be
+   * lost and the picker would stay empty. `undefined` means "no frame yet".
+   */
+  private lastSources: DesktopSourceInfo[] | undefined;
+  private lastStats: DesktopStats | undefined;
   /** Rejects the in-flight `start()` when `close()` is called while waiting. */
   private pendingReject: ((error: Error) => void) | null = null;
   /** Unsubscribes from the peer's connection state. Lazily created. */
@@ -180,17 +188,20 @@ export class DesktopClient {
       case 'desktop-sources': {
         const payload = msg.payload as
           { sources?: DesktopSourceInfo[] } | undefined;
+        // Cache before fan-out so a listener registered later still sees it,
+        // and so the cache updates even with zero listeners attached.
+        this.lastSources = payload?.sources ?? [];
         for (const listener of this.sourceListeners.slice()) {
-          listener(payload?.sources ?? []);
+          listener(this.lastSources);
         }
         break;
       }
       case 'desktop-stats': {
-        const payload = msg.payload as DesktopStats | undefined;
-        if (payload) {
-          for (const listener of this.statsListeners.slice()) {
-            listener(payload);
-          }
+        const stats = this.parseStats(msg.payload);
+        if (!stats) break;
+        this.lastStats = stats;
+        for (const listener of this.statsListeners.slice()) {
+          listener(stats);
         }
         break;
       }
@@ -200,9 +211,30 @@ export class DesktopClient {
     }
   }
 
+  /**
+   * Accept only a well-formed stats frame. A partial payload (e.g. a frame from
+   * an older agent) would otherwise flow into the UI and render `NaN×NaN`.
+   */
+  private parseStats(payload: unknown): DesktopStats | null {
+    if (typeof payload !== 'object' || payload === null) return null;
+    const p = payload as Partial<DesktopStats>;
+    if (
+      !Number.isFinite(p.width) ||
+      !Number.isFinite(p.height) ||
+      !Number.isFinite(p.fps) ||
+      !Number.isFinite(p.targetBitrateBps)
+    ) {
+      return null;
+    }
+    return p as DesktopStats;
+  }
+
   /** Capture-source enumeration pushed by the agent (once, after connect). */
   onSources(handler: (sources: DesktopSourceInfo[]) => void): () => void {
     this.sourceListeners.push(handler);
+    // Register first, then replay: run-to-completion means no frame can slip
+    // between the two, so a cached frame is delivered exactly once.
+    if (this.lastSources !== undefined) handler(this.lastSources);
     return () => {
       const idx = this.sourceListeners.indexOf(handler);
       if (idx >= 0) this.sourceListeners.splice(idx, 1);
@@ -212,6 +244,7 @@ export class DesktopClient {
   /** Telemetry (resolution/fps/effective bitrate), best-effort. */
   onStats(handler: (stats: DesktopStats) => void): () => void {
     this.statsListeners.push(handler);
+    if (this.lastStats !== undefined) handler(this.lastStats);
     return () => {
       const idx = this.statsListeners.indexOf(handler);
       if (idx >= 0) this.statsListeners.splice(idx, 1);
@@ -222,8 +255,12 @@ export class DesktopClient {
    * Ask the agent to switch to `sourceId`.
    *
    * `sendJson` throws when the `'control'` label is not registered
-   * (`data-channel.ts:75-77`), so this is guarded: a click before the channel
-   * opens warns and returns rather than throwing into the UI handler.
+   * (`data-channel.ts:75-77`), and `RTCDataChannel.send()` throws
+   * `InvalidStateError` when the channel is not `open`. The offerer pre-creates
+   * the channel in its constructor, so `hasChannel` is true from the start even
+   * while it is still `connecting` — hence the guard tests `readyState`, not
+   * mere registration. A click before the channel opens warns and returns
+   * rather than throwing into the UI handler.
    */
   selectSource(sourceId: string): void {
     this.sendControl('desktop-select', { sourceId });
@@ -235,7 +272,7 @@ export class DesktopClient {
   }
 
   private sendControl(type: string, payload: unknown): void {
-    if (!this.peer.dataChannels.hasChannel('control')) {
+    if (this.peer.dataChannels.getChannel('control')?.readyState !== 'open') {
       console.warn(`[desktop] control channel not open; dropping ${type}`);
       return;
     }
