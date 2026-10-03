@@ -4,6 +4,7 @@ import { getDb, closeDb } from '../src/db/client';
 import { agents, sessions } from '../src/db/schema';
 import { eq } from 'drizzle-orm';
 import { isAgentOnline } from '../src/utils/agent';
+import { updateSystemSettings } from '../src/utils/settings';
 
 // In-process secrets for tests. These satisfy the "at least some entropy"
 // expectation without depending on the real deployment env vars.
@@ -86,7 +87,11 @@ describe('Agents, Devices & Sessions REST API', () => {
   let userId: string;
 
   beforeEach(async () => {
+    closeDb();
     db = getDb(':memory:');
+    // Auto-approve users so registered users receive tokens without a separate
+    // approval step (pre-approval-flow behaviour expected by these tests).
+    await updateSystemSettings(db, { autoApproveUsers: true });
 
     const app = createApp();
     const regRes = await app.request('/api/auth/register', {

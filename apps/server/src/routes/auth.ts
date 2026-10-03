@@ -1,8 +1,9 @@
 import { Hono } from 'hono';
 import type { AppContext } from '../types.js';
 import { users, revokedTokens } from '../db/schema.js';
-import { eq, or } from 'drizzle-orm';
+import { eq, or, count } from 'drizzle-orm';
 import { hashPassword, verifyPassword } from '../utils/crypto.js';
+import { getSystemSettings } from '../utils/settings.js';
 import {
   signAccessToken,
   signRefreshToken,
@@ -77,6 +78,16 @@ auth.post('/register', async (c) => {
 
   const db = c.get('db');
 
+  // Enforce the registration gate before creating any user.
+  const settings = await getSystemSettings(db);
+  if (!settings.allowRegistration) {
+    throw new AppError(
+      'Registration is currently disabled',
+      403,
+      'REGISTRATION_DISABLED',
+    );
+  }
+
   // Check username or email uniqueness
   const conditions = [eq(users.username, username)];
   if (body.email) {
@@ -98,6 +109,22 @@ auth.post('/register', async (c) => {
   const passwordHash = await hashPassword(body.password);
   const userId = crypto.randomUUID();
 
+  // Bootstrap logic: the very first registered user becomes an approved admin;
+  // every subsequent user is a regular user whose approval status is governed by
+  // the `autoApproveUsers` setting (default: pending manual approval).
+  const userCountRow = await db.select({ value: count() }).from(users).get();
+  const isFirstUser = userCountRow?.value === 0;
+
+  let role: 'admin' | 'user';
+  let approvalStatus: 'pending' | 'approved' | 'rejected';
+  if (isFirstUser) {
+    role = 'admin';
+    approvalStatus = 'approved';
+  } else {
+    role = 'user';
+    approvalStatus = settings.autoApproveUsers ? 'approved' : 'pending';
+  }
+
   const [newUser] = await db
     .insert(users)
     .values({
@@ -107,11 +134,25 @@ auth.post('/register', async (c) => {
       publicKey: body.publicKey,
       passwordHash,
       isActive: true,
+      role,
+      approvalStatus,
     })
     .returning();
 
   if (!newUser) {
     throw new AppError('Failed to create user', 500, 'DATABASE_ERROR');
+  }
+
+  // Pending users cannot receive tokens — they must wait for admin approval.
+  if (approvalStatus === 'pending') {
+    return c.json(
+      {
+        user: toPublicUser(newUser),
+        requiresApproval: true,
+        message: 'Registration successful. Your account is pending administrator approval.',
+      },
+      201,
+    );
   }
 
   const ttl = getAccessTokenTtl();
@@ -130,6 +171,7 @@ auth.post('/register', async (c) => {
   return c.json(
     {
       user: toPublicUser(newUser),
+      requiresApproval: false,
       token,
       refreshToken,
       expiresIn: exp - Math.floor(Date.now() / 1000),
@@ -178,6 +220,20 @@ auth.post('/login', async (c) => {
     );
   }
 
+  if (user.approvalStatus === 'pending') {
+    throw new AppError(
+      'Your account is pending administrator approval',
+      403,
+      'USER_PENDING_APPROVAL',
+    );
+  }
+  if (user.approvalStatus === 'rejected') {
+    throw new AppError(
+      'Your account registration was rejected',
+      403,
+      'USER_REJECTED',
+    );
+  }
   if (!user.isActive) {
     throw new AppError('User account is inactive', 401, 'ACCOUNT_INACTIVE');
   }
