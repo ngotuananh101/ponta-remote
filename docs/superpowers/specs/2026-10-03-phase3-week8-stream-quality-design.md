@@ -65,7 +65,7 @@ Frames reuse the existing envelope `DataChannelMessage<T>` (`packages/shared/src
 | `desktop-sources` | agent → browser | `{ sources: DesktopSourceInfo[] }` | Enumerate capture sources after connect; the streaming one is flagged `default` |
 | `desktop-select` | browser → agent | `{ sourceId: string }` | Switch to a different source (only sent when it differs from the streaming one) |
 | `desktop-bitrate` | browser → agent | `{ bitrateBps: number }` | Manual bitrate target |
-| `desktop-stats` | agent → browser | `{ width, height, fps, targetBitrateBps }` | Telemetry for the UI (best-effort) |
+| `desktop-stats` | agent → browser | `{ width, height, fps, targetBitrateBps, status? }` | Telemetry for the UI (best-effort); `status` carries an optional agent→browser note (a refused selection, a quality downgrade) |
 
 ```typescript
 export interface DesktopSourceInfo {
@@ -81,9 +81,23 @@ export interface DesktopSourceInfo {
   isPrimary: boolean;
   default: boolean;                 // the entry the agent is streaming right now
 }
+
+export interface DesktopStats {
+  width: number;
+  height: number;
+  fps: number;
+  targetBitrateBps: number;
+  /** Optional agent→browser note; absent on ordinary telemetry. */
+  status?: { kind: 'select-refused' | 'quality-downgraded'; detail: string };
+}
 ```
 
-`id` values are produced by the agent and are opaque to the browser; the agent validates a `desktop-select` id against its own enumeration before using it (an unknown id is refused with a logged `desktop-stats`-style error frame, not a panic).
+**Error path (the only one):** there is **no** dedicated error frame type — the four types above are the whole vocabulary. When the agent cannot honour a request it stays silent on the request itself and, where a browser-visible outcome exists, appends a `status` to the next `desktop-stats`:
+
+- **Unknown `desktop-select` id** → the agent logs it, leaves the current stream running, and sends a `desktop-stats` with `status.kind = 'select-refused'` (the UI keeps showing the old source and can surface the note). No `desktop-select` ack exists; the stream continuing on the previous source is the observable truth.
+- **Sustain downgrade** (ADR-24) → the agent emits a `desktop-stats` whose `width`/`height` reflect the new (720p) size with `status.kind = 'quality-downgraded'`.
+
+An unknown `type` or a frame on the wrong channel is dropped and logged, never answered.
 
 ### 2.3 Session sequence (desktop, Week 8)
 
@@ -106,7 +120,7 @@ All facts below were verified against crate sources on disk, by measurement, or 
 
 ### 3.1 `openh264` 0.9.8 — software throughput (measured)
 
-A standalone benchmark (throwaway binary, 2026-10-03) built the encoder with the **exact** agent config — `UsageType::ScreenContentRealTime`, `Complexity::Low`, `RateControlMode::Bitrate`, `intra_frame_period = 60`, `VuiConfig::bt709()` — and timed **only** the `encode()` call over 200 pre-generated frames per case.
+A standalone benchmark (throwaway binary, 2026-10-03) built the encoder with the agent config's core settings — `UsageType::ScreenContentRealTime`, `Complexity::Low`, `RateControlMode::Bitrate`, `intra_frame_period = 60`, `VuiConfig::bt709()` (the bench additionally sets `adaptive_quantization(false)`/`background_detection(false)`, both library defaults the agent leaves unset) — and timed **only** the `encode()` call over 200 pre-generated frames per case.
 
 | Case (moving-block content) | ms/frame | Budget | Headroom | Verdict |
 |---|---|---|---|---|
@@ -114,14 +128,14 @@ A standalone benchmark (throwaway binary, 2026-10-03) built the encoder with the
 | 1080p30 (1920×1080, 6 Mbps) | 28.1 | 33.3 ms | **1.2×** | marginal |
 | 1080p60 (1920×1080, 8 Mbps) | 28.2 | 16.7 ms | **0.6×** | infeasible |
 
-- **Methodology / caveat.** Host: Intel i5-14400 (16 threads), a single encoder instance, release profile. openh264's `num_threads` (tested at 1, 4, 8) made **no measurable difference** — slice-level threading does not help this workload. Cost scales ~linearly with pixel count (1080p ≈ 2.49× the pixels of 720p → ≈ 2.49× the time). Content was synthetic ("mostly-static gradient + a moving block"), which approximates a desktop but is **not** a real screen; a weaker host, or contention with the capture thread and the WebRTC stack, will be worse.
+- **Methodology / caveat.** Host: Intel i5-14400 (16 threads), a single encoder instance, release profile. openh264's `num_threads` (tested at 1, 4, 8) made **no measurable difference** — slice-level threading does not help this workload. Cost scales ~linearly with pixel count (1080p ≈ 2.25× the pixels of 720p → ≈ 2.49× the time, measured 28.1 / 11.3 ms). Content was synthetic ("mostly-static gradient + a moving block"), which approximates a desktop but is **not** a real screen; a weaker host, or contention with the capture thread and the WebRTC stack, will be worse.
 - **Consequence.** 1080p30 is achievable but with only ~5 ms/frame of slack; 1080p60 with software H.264 is out. This drives ADR-24 (conditional 1080p30 + 720p30 floor).
 
 ### 3.2 `openh264` 0.9.8 — runtime reconfiguration
 
-- `Encoder::reinit(width, height)` is **private** (`openh264-0.9.8/src/encoder.rs:950`) and reads `self.config.target_bitrate` / `self.config.max_frame_rate` (lines 972, 974); `self.config` is private. `reinit` is only reached automatically when the frame **dimensions change** (`encode_at`, line ~905), and it re-applies the *same* config — so a dimension change does not help change the bitrate.
+- `Encoder::reinit(width, height)` is **private** (`openh264-0.9.8/src/encoder.rs:950`) and reads `self.config.target_bitrate` / `self.config.max_frame_rate` (lines 972, 974); `self.config` is private. `reinit` is only reached automatically when the frame **dimensions change** (`encode_at`, lines 909/913), and it re-applies the *same* config — so a dimension change does not help change the bitrate.
 - There is **no public API** to change bitrate at runtime. Two paths exist:
-  1. `pub const unsafe fn raw_api(&mut self) -> &mut EncoderRawAPI` (`encoder.rs:1064`) exposes `set_option` (wired at `encoder.rs:60`), letting a caller push a modified `SEncParamExt` (including `iTargetBitrate`) via `ENCODER_OPTION_SVC_ENCODE_PARAM_EXT`. This is the **spike's hypothesis** (§1.1 goal 4, ADR-23) — whether it applies without a visible glitch is unverified.
+  1. `pub const unsafe fn raw_api(&mut self) -> &mut EncoderRawAPI` (`encoder.rs:1062`) exposes `set_option` (wired at `encoder.rs:60`), letting a caller push a modified `SEncParamExt` (including `iTargetBitrate`) via `ENCODER_OPTION_SVC_ENCODE_PARAM_EXT`. This is the **spike's hypothesis** (§1.1 goal 4, ADR-23) — whether it applies without a visible glitch is unverified.
   2. Rebuild the `Encoder` with a new `EncoderConfig` — guaranteed to work, but emits a fresh SPS/PPS + IDR (a visible keyframe blip) on every change.
 - **Consequence.** Runtime bitrate change is possible-but-unproven (path 1) or possible-with-glitch (path 2). ADR-23 makes the choice spike-gated.
 
@@ -129,7 +143,7 @@ A standalone benchmark (throwaway binary, 2026-10-03) built the encoder with the
 
 - Send-side congestion control exists and is not something we must implement: `ReportingEstimator::new(Gcc::new(INITIAL, MIN, MAX))` + `configure_congestion_control(registry, estimator, CongestionFeedback::Twcc, &mut media_engine)` — the shipped example `webrtc-0.21.0/examples/bandwidth-estimation-from-disk/bandwidth-estimation-from-disk.rs` builds exactly this.
 - The estimator drives `Attribute::TargetBitrateChanged` into the interceptor chain (`rtc-0.21.0/src/peer_connection/handler/interceptor.rs:782`), and the value surfaces in outbound-rtp `target_bitrate` stats.
-- `RtpSender::set_parameters(RTCRtpSendParameters, Option<RTCSetParameterOptions>)` (`rtc-0.21.0/src/rtp_transceiver/rtp_sender/mod.rs:306`) updates encoding parameters (max bitrate, frame rate) at runtime; `RTCRtpEncodingParameters.max_bitrate` is the field.
+- `RtpSender::set_parameters(RTCRtpSendParameters, Option<RTCSetParameterOptions>)` (`rtc-0.21.0/src/rtp_transceiver/rtp_sender/mod.rs:307`) updates encoding parameters (max bitrate, frame rate) at runtime; `RTCRtpEncodingParameters.max_bitrate` is the field.
 - **Consequence.** The *transport* half of ABR is available. The unknown half is applying a target to openh264 (§3.2) — which is what the spike settles.
 
 ### 3.4 `xcap` 0.9.8 — enumeration and geometry already exist
@@ -249,6 +263,7 @@ export interface DesktopStats {
   height: number;
   fps: number;
   targetBitrateBps: number;
+  status?: { kind: 'select-refused' | 'quality-downgraded'; detail: string };
 }
 ```
 
@@ -345,7 +360,7 @@ apps/agent/src/desktop.rs   (additions)
 
 `SessionHandler::on_data_channel` (`rtc.rs:492-518`) currently accepts only `TERMINAL_LABEL` and closes everything else. It gains a desktop branch:
 
-- The desktop peer is built with `media_only = true` today (`main.rs:616-617`), which shortens ICE timeouts. With a control channel the peer should use the **terminal-shaped** ICE defaults; `build_peer`'s `media_only` flag is split into `media_only` (no data channel) vs `has_control` so a desktop peer with a control channel is not given the shortened timeouts.
+- The desktop peer is built with `media_only = true` today (`main.rs:621`, `build_peer(…, mode == SessionMode::Desktop)`), which shortens ICE timeouts. With a control channel the peer should use the **terminal-shaped** ICE defaults; `build_peer`'s `media_only` flag is split into `media_only` (no data channel) vs `has_control` so a desktop peer with a control channel is not given the shortened timeouts.
 - `on_data_channel`: accept exactly one `'control'` channel for a desktop session (reject a second, mirroring the terminal single-channel rule); publish it to the session loop exactly as the terminal channel is published (`Arc<OnceLock<..>>` + `open_tx`).
 
 `run_desktop_session` (`main.rs:986`) changes:
@@ -389,7 +404,7 @@ loop select stop / control / ticker:
 
 - **`apply_bitrate`** is the spike-gated seam (ADR-23): if the spike **passed**, `unsafe { encoder.raw_api() }` + `SetOption(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, params with iTargetBitrate = bps)` — no rebuild, no blip. If the spike **failed**, rebuild the encoder from `profile.with_bitrate(bps)` and force an IDR (one blip, on explicit user action). Either way the value is reflected in the next `desktop-stats`.
 - **Source swap**: stop the old `FrameSource`, `source_for(id, profile)`, build a new encoder (dimensions may differ), swap both. Bounded by `DESKTOP_SELECT_APPLY_TIMEOUT`; a source that fails to start leaves the current stream running and logs.
-- **Sustain fallback** (ADR-24): count consecutive frames whose encode time exceeds the frame budget; at a threshold (default 30 frames ≈ 1 s) rebuild at `SAFE_720P30`, emit a `desktop-stats` noting the downgrade, and do not oscillate (a hysteresis: only downgrade once per session unless the user raises bitrate manually).
+- **Sustain fallback** (ADR-24): count consecutive frames whose encode time exceeds the frame budget; at a threshold (default 30 frames ≈ 1 s) rebuild at `SAFE_720P30`, emit a `desktop-stats` with `status.kind = 'quality-downgraded'` (its `width`/`height` already reflect the new size), and do not oscillate (a hysteresis: only downgrade once per session unless the user raises bitrate manually).
 
 ### 6.5 Rust unit tests
 
@@ -422,7 +437,7 @@ loop select stop / control / ticker:
 
 - A **source picker** in the overlay area: a dropdown listing `tab.desktopSources`, the `default`/current entry marked, changing it calls `store.selectDesktopSource`. Hidden until `desktopSources` is non-empty. For the test source this is a single auto-selected entry, so E2E never interacts with it.
 - A **bitrate control** (small slider/number) calling `store.setDesktopBitrate`, initialised from `tab.desktopStats?.targetBitrateBps`.
-- A **stats line** (`1920×1080 · 30 fps · 6 Mbps`) from `tab.desktopStats`.
+- A **stats line** (`1920×1080 · 30 fps · 6 Mbps`) from `tab.desktopStats`. When `desktopStats.status` is present the line appends its `detail` (e.g. "720p (quality downgraded)" or "source switch refused").
 - The `<video>` keeps **no `controls`** and **no pointer/keyboard handlers** — input is Week 9. The existing `DesktopView.test.ts` assertion (no `controls`) stays green.
 
 **`WorkspaceView.vue`** footer: for desktop tabs the hardcoded `Media: H.264 · view-only` becomes `Media: H.264 · <stats or "connecting">`.
@@ -453,6 +468,7 @@ New tests (Linux only, `describe.skipIf(!isLinux)`):
 
 - **Control channel present.** After the track arrives, `desktop-sources` is received within the control timeout; it has exactly one entry with `default === true` for the test source; the entry carries the expected geometry fields.
 - **Manual bitrate.** Send a `desktop-bitrate` frame; a subsequent `desktop-stats` reports the new `targetBitrateBps`. (This asserts the *wire path* and the stats echo — not the encoder internals, which are unit-tested.)
+- **Refused selection error path.** Send a `desktop-select` with an id the agent never enumerated; the agent keeps streaming (RTP continues) and emits a `desktop-stats` with `status.kind === 'select-refused'` — pinning the §2.2 error contract.
 - **Existing media assertions unchanged.** The Week 7 checks (a video track arrives, ≥ 30 RTP packets in 15 s at the negotiated PT, ≥ 1 IDR, teardown leaves the agent able to serve a second session) still pass.
 - **Terminal unaffected.** The terminal E2E suite passes unchanged; the new `'control'` label is desktop-only.
 
@@ -483,13 +499,13 @@ No new workflow changes are required beyond Week 7's apt steps: the control chan
 | 1080p30 / 720p30 fallback on a real screen | Manual demo (§8.4) |
 | 1080p60 software infeasible | Benchmark (§3.1, Appendix A) |
 | Runtime bitrate apply (spike) | Spike (ADR-23); unit test pins both branches |
-| macOS/Windows compile | build-agent matrix |
+| macOS/Windows compile | `Build Agent / macOS/x64`, `Build Agent / macOS/arm64`, `Build Agent / Windows/x64-msvc` |
 
 ---
 
 ## 9. Security & Error Handling
 
-- **The control channel is a new inbound surface.** The agent accepts exactly one `'control'` channel for a desktop session and only three frame types (`desktop-select`, `desktop-bitrate`, plus the unknown-type drop). `desktop-select` ids are validated against the agent's own enumeration — an unknown id is refused and logged, never used to build a source. `desktop-bitrate` is clamped to a sane range (`MIN..MAX_BITRATE_BPS`) so a hostile value cannot drive the encoder to a degenerate config.
+- **The control channel is a new inbound surface.** The agent accepts exactly one `'control'` channel for a desktop session and only two actionable frame types (`desktop-select`, `desktop-bitrate`; anything else is dropped). `desktop-select` ids are validated against the agent's own enumeration — an unknown id is refused: the agent logs it, leaves the stream running, and reports `status.kind = 'select-refused'` on the next `desktop-stats` (§2.2); the id is never used to build a source. `desktop-bitrate` is clamped to a sane range (`MIN..MAX_BITRATE_BPS`) so a hostile value cannot drive the encoder to a degenerate config.
 - **No new authorization, and that is stated, not hidden.** As in Week 7, the server never sees data-channel bytes (it relays only SDP/ICE), so the **agent** is the only enforcement point. The agent authorizes a session by the `desktop` capability label alone; there is no per-peer identity check. This is the E2EE audit's **H3** (agent does not verify the client), still open, and it is **unchanged by this week**. The audit's **H1** (client-controlled `shell`) is terminal-only and untouched here. The audit's **H2** (enforce `approved`) is browser-fixed/server-open; the audit's **M2** (WS close codes) is open. None of these are introduced by Week 8 — but the picker and bitrate frames do add *inputs* the agent must validate, which is why validation is explicit above. Full reference: `docs/security/2026-10-01-e2ee-zero-trust-audit.md` (WS3).
 - **Resource bounds.** One control channel per session (a second is closed); one source at a time (a swap stops the previous `FrameSource`); the encoder is single-instance; the source-swap and bitrate paths are bounded (`DESKTOP_SELECT_APPLY_TIMEOUT`); the sustain fallback cannot oscillate (hysteresis, ADR-24).
 - **Error surfacing.** A source that fails to start on selection leaves the current stream running and logs; a capture failure on the default source still refuses the offer *before* the answer (`approved: false`), unchanged. The browser never sees an unhandled rejection — `selectSource`/`setBitrate` are guarded against a closed channel (§5.3).
@@ -514,10 +530,10 @@ No new workflow changes are required beyond Week 7's apt steps: the control chan
 
 ### 10.2 Acceptance criteria
 
-1. `cargo test --locked` passes with the new unit tests on Linux; `cargo build --locked` succeeds for musl (no capture deps) — verified by CI.
-2. `pnpm lint && pnpm typecheck && pnpm test` pass across the workspace including the new test surfaces.
-3. E2E `desktop.e2e.test.ts` passes in CI: the control channel opens and `desktop-sources` arrives with one `default: true` entry; a `desktop-bitrate` frame is reflected in a later `desktop-stats`; the Week 7 media assertions (track, ≥ 30 RTP packets in 15 s, ≥ 1 IDR, clean teardown + second session) still pass.
-4. The existing terminal E2E suite still passes unchanged (terminal regression gate).
+1. `cargo test --locked` passes with the new unit tests on Linux — the `Build Agent / Verify` gate; the musl target (no capture deps) still builds — the `Build Agent / Linux/x64-musl` gate.
+2. `pnpm lint && pnpm typecheck && pnpm test` pass across the workspace including the new test surfaces — the `CI (Node) / Lint, Typecheck, Format & Node Tests` gate.
+3. E2E `desktop.e2e.test.ts` passes: the control channel opens and `desktop-sources` arrives with one `default: true` entry; a `desktop-bitrate` frame is reflected in a later `desktop-stats`; the Week 7 media assertions (track, ≥ 30 RTP packets in 15 s, ≥ 1 IDR, clean teardown + second session) still pass — the `CI (E2E) / Cross-language terminal E2E` gate.
+4. The existing terminal E2E suite still passes unchanged (terminal regression gate, `CI (E2E) / Cross-language terminal E2E`).
 5. The recorded manual demo shows a real-screen stream in Chrome at 1080p30 (or the documented 720p30 fallback on a host that cannot sustain it), the source picker listing monitors/windows, a working source switch, and a visible bitrate change — with LAN glass-to-glass latency observed under 200 ms (informal, not gated).
 6. `ARCHITECTURE.md` records the Week 8 scope and the perf-table row no longer names H.265 as an achievable target (§11).
 
@@ -552,7 +568,7 @@ Two drifts are reconciled in the same PR (D8):
 1. **Roadmap §8** (`ARCHITECTURE.md:941-944`): the "Tuần 8-9: Chất lượng & tương tác (sắp tới)" list gains a Week 8 sub-entry marked done for this week's items — quality profile + manual bitrate, source picker — with input forwarding and hardware codec noted as still open (Week 9 / spike). Week 9's input item is left unchecked (owned by Spec B).
 2. **Perf table (§11, `ARCHITECTURE.md:1080-1081`)**: the row `Desktop stream (Phase 3 target) | 60fps | Hardware H.265` is corrected — H.265 is not viable in WebRTC (§3.5). Replace with `Desktop stream (Week 8) | 1080p30 (720p30 floor) | Software H.264 (openh264)` and a `Desktop stream (hardware, future) | 60fps | H.264 hardware / AV1 (spike-gated, ADR-25)` row that names the viable alternatives instead of the unusable one.
 
-Phase 4's stub (`ARCHITECTURE.md:946-948`) is **not** touched (Q7).
+Phase 4's stub (`ARCHITECTURE.md:946-948`) is **not** touched (Phase 4 is out of scope; §1.2).
 
 ---
 
