@@ -606,14 +606,14 @@ git commit -m "feat(desktop-core): add DesktopClient control surface (sources, s
 ### Task 3: Agent — `StreamProfile`, source enumeration, `WindowSource` (D3a)
 
 **Files:**
-- Modify: `apps/agent/src/desktop.rs` (`StreamProfile`, `DesktopSourceInfo`, `enumerate_sources`, `source_for`, `default_source_id`, `ScreenSource::for_monitor` replacing `ScreenSource::new`, new `WindowSource`, `DesktopEncoder::new(profile)`, `run_stream` signature — profile only in this task; **delete `ScreenSource::new` and `primary_recorder`**)
-- Modify: `apps/agent/src/main.rs` (`--desktop-profile`/`AGENT_DESKTOP_PROFILE` and `--desktop-default-source`/`AGENT_DESKTOP_DEFAULT_SOURCE`; build the pre-answer default source from the resolved id; thread `profile` into `run_desktop_session`)
-- Test: `apps/agent/src/desktop.rs` (`#[cfg(test)] mod tests`)
+- Modify: `apps/agent/src/main.rs` (`StreamProfile` + its `FromStr`, beside `DesktopSource` — **unconditional**, see Step 1; `--desktop-profile`/`AGENT_DESKTOP_PROFILE` and `--desktop-default-source`/`AGENT_DESKTOP_DEFAULT_SOURCE`; `SessionConfig` fields; build the pre-answer default source from the resolved id; thread `profile` into `run_desktop_session`)
+- Modify: `apps/agent/src/desktop.rs` (`DesktopSourceInfo`, `enumerate_sources`, `source_for`, `default_source_id`, `ScreenSource::for_monitor` replacing `ScreenSource::new`, new `WindowSource`, `DesktopEncoder::new(profile)`, `run_stream` signature — profile only in this task; **delete `MAX_WIDTH`/`MAX_HEIGHT`, `ScreenSource::new`, `primary_recorder`**, `use crate::StreamProfile`)
+- Test: `apps/agent/src/main.rs` (`StreamProfile` parse + `frame_budget` tests) and `apps/agent/src/desktop.rs` (`#[cfg(test)] mod tests`)
 
 **Interfaces:**
 - Consumes: `xcap` — `Monitor::{all, from_point, id, name, friendly_name, x, y, width, height, rotation, scale_factor, is_primary, video_recorder}`, `Window::{all, id, title, x, y, width, height, is_minimized, capture_image}`; the existing `RawFrame`, `FrameSource`, `downscale`, `crop_to_even`, `TestPatternSource`, `ScreenSource`, `DesktopEncoder`.
 - Produces (relied on by Task 4):
-  - `pub struct StreamProfile { pub max_width: u32, pub max_height: u32, pub fps: f32, pub bitrate_bps: u32 }` with `pub const DEFAULT_1080P30: Self`, `pub const SAFE_720P30: Self`, and `impl std::str::FromStr` (`"1080p30"`/`"720p30"`, else `Err`).
+  - `pub struct StreamProfile { pub max_width: u32, pub max_height: u32, pub fps: f32, pub bitrate_bps: u32 }` with `pub const DEFAULT_1080P30: Self`, `pub const SAFE_720P30: Self`, and `impl std::str::FromStr` (`"1080p30"`/`"720p30"`, else `Err`). **Defined in `main.rs` (unconditional), not `desktop.rs`** — `SessionConfig` holds one, and a type named only inside the musl-gated `desktop` module is E0433 on musl.
   - `pub struct DesktopSourceInfo { pub id: String, pub kind: SourceKind, pub name: String, pub width: u32, pub height: u32, pub x: i32, pub y: i32, pub scale_factor: f32, pub rotation: f32, pub is_primary: bool, pub default: bool }` with `#[derive(Clone, Debug, Serialize)]`.
   - `pub fn enumerate_sources() -> Result<Vec<DesktopSourceInfo>>` — **sync**: it only reads xcap accessors.
   - `pub async fn source_for(id: &str, profile: StreamProfile) -> Result<Box<dyn FrameSource>>` — **async** because `ScreenSource::for_monitor` waits on the first-frame handshake (the Week 7 `ScreenSource::new` was already `async` for the same reason). A sync `source_for` could not build a monitor source without blocking the runtime. Handles the `monitor:`, `window:`, and `test:` schemes.
@@ -627,7 +627,9 @@ git commit -m "feat(desktop-core): add DesktopClient control surface (sources, s
 
 - [ ] **Step 1: Add the `StreamProfile` and its parsing**
 
-In `apps/agent/src/desktop.rs`, replace the `MAX_WIDTH`/`MAX_HEIGHT` constants (lines 26-28) with the profile:
+**Where it lives matters — it goes in `main.rs`, next to `DesktopSource`, not in `desktop.rs`.** `StreamProfile` is *pure data*: it names no `xcap` type and calls no capture API. `SessionConfig` (in `main.rs`, unconditional) holds a `desktop_profile: StreamProfile` field, and a struct field whose type is named only inside a `#[cfg]`-gated module is an **E0433 name-resolution error** on the target where that module is compiled out — `#[allow(dead_code)]` cannot fix it, because the *type* is not in scope at all. `mod desktop;` is `#[cfg(not(target_env = "musl"))]`, so a `StreamProfile` defined in `desktop.rs` would break `Build Agent / Linux/x64-musl` (the musl leg runs `cargo build --release` only, but E0433 is a build error, not a lint). `DesktopSource` already lives unconditionally in `main.rs` for exactly this reason; `StreamProfile` joins it. The musl artifact accepts and validates the profile like any other CLI value, then refuses the desktop offer — the same shape `DesktopSource` has today.
+
+In `apps/agent/src/main.rs`, beside `enum DesktopSource`, replace the `MAX_WIDTH`/`MAX_HEIGHT` constants (deleted from `apps/agent/src/desktop.rs` lines 26-28) with the profile:
 
 ```rust
 /// The resolved quality for one desktop session (ADR-21).
@@ -635,6 +637,11 @@ In `apps/agent/src/desktop.rs`, replace the `MAX_WIDTH`/`MAX_HEIGHT` constants (
 /// Resolved once at session start from the CLI/env, then read by the downscale
 /// box, the ticker cadence, and the encoder config. `bitrate_bps` is the only
 /// member adjustable after start (ADR-23).
+///
+/// Defined here, beside `DesktopSource`, rather than in `desktop.rs`: it is pure
+/// data, and `SessionConfig` (which is unconditional) holds one. A type named
+/// only inside the `#[cfg(not(target_env = "musl"))]` `desktop` module would be
+/// E0433 on musl.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StreamProfile {
     pub max_width: u32,
@@ -682,11 +689,19 @@ impl std::str::FromStr for StreamProfile {
 }
 ```
 
-Update `downscale`'s doc (it no longer mentions `MAX_WIDTH`), and change `run_stream`'s body to use the profile (signature change is Step 5). The `FRAME_INTERVAL` const (line 481) is deleted; `Sample.duration` becomes `profile.frame_budget()`.
+`main.rs` already has `use std::time::Duration;` and `use anyhow::{bail, Context, Result};`, so this compiles as-is.
+
+In `apps/agent/src/desktop.rs`, delete `MAX_WIDTH`/`MAX_HEIGHT` and bring the type into scope so the pipeline can name it:
+
+```rust
+use crate::StreamProfile;
+```
+
+Update `downscale`'s doc (it no longer mentions `MAX_WIDTH`), and change `run_stream`'s body to use the profile (signature change is Step 4). The `FRAME_INTERVAL` const (line 481) is deleted; `Sample.duration` becomes `profile.frame_budget()`.
 
 - [ ] **Step 2: Write the failing `StreamProfile` tests**
 
-Append to `mod tests`:
+The type now lives in `main.rs`, so its tests live in `main.rs`'s `#[cfg(test)] mod tests` too (append after the existing tests). `main.rs`'s test module has `use super::*;`, so `StreamProfile` is already in scope:
 
 ```rust
     #[test]
@@ -714,10 +729,12 @@ Append to `mod tests`:
     }
 ```
 
+`desktop.rs`'s tests reach `StreamProfile` through the `use crate::StreamProfile;` added in Step 1, so the downscale/encoder tests in later steps can keep naming it directly.
+
 - [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test --manifest-path apps/agent/Cargo.toml stream_profile`
-Expected: FAIL to compile — `StreamProfile` is not yet referenced by `run_stream`/`DesktopEncoder`, and the tests call `frame_budget`. (Compile failure is the failing test.)
+Expected: FAIL to compile. Two reasons, both intended at this point: `frame_budget` is not yet called by the pipeline (Step 4), and — because Step 1 deleted `MAX_WIDTH`/`MAX_HEIGHT` while `downscale`'s production call site and the three downscale tests still read them — the crate does not build until Step 4 repoints every reader. (Compile failure is the failing test here.)
 
 - [ ] **Step 4: Implement `StreamProfile` in the pipeline**
 
@@ -768,6 +785,47 @@ pub async fn run_stream(
 
 Update the two existing `run_stream` call sites in tests (`run_stream_stops_cleanly_without_a_bound_track`, `run_stream_honours_a_pre_set_stop_signal`) to pass `StreamProfile::SAFE_720P30`, and `encoder_emits_annex_b_and_an_idr_first` to call `DesktopEncoder::new(StreamProfile::SAFE_720P30)`.
 
+**Do not stop there — Step 1 deleted `MAX_WIDTH`/`MAX_HEIGHT`, so every reader of them no longer compiles.** There are four: the production call in `run_stream`'s loop (desktop.rs:528 — Step 4 above already repoints it at `profile.max_width`/`profile.max_height`), plus three tests. `cargo test` (and therefore `Build Agent / Verify`, which runs the test target) fails with `cannot find value MAX_WIDTH in this scope` until all four are repointed. Rewrite each test's arguments to `StreamProfile::SAFE_720P30.max_width, StreamProfile::SAFE_720P30.max_height` (the same box the deleted consts held), keeping every assertion identical:
+
+```rust
+    #[test]
+    fn downscale_fits_1080p_into_the_720p_box() {
+        let frame = downscale(
+            &solid(1920, 1080),
+            StreamProfile::SAFE_720P30.max_width,
+            StreamProfile::SAFE_720P30.max_height,
+        );
+        assert_eq!((frame.width, frame.height), (1280, 720));
+        assert_eq!(frame.rgba.len(), (1280 * 720 * 4) as usize);
+    }
+
+    #[test]
+    fn downscale_preserves_aspect_for_an_ultrawide() {
+        let frame = downscale(
+            &solid(2560, 1080),
+            StreamProfile::SAFE_720P30.max_width,
+            StreamProfile::SAFE_720P30.max_height,
+        );
+        assert_eq!((frame.width, frame.height), (1280, 540));
+        assert_eq!(frame.width % 2, 0);
+        assert_eq!(frame.height % 2, 0);
+    }
+
+    #[test]
+    fn downscale_never_upscales_a_small_screen() {
+        let source = solid(800, 600);
+        let frame = downscale(
+            &source,
+            StreamProfile::SAFE_720P30.max_width,
+            StreamProfile::SAFE_720P30.max_height,
+        );
+        assert_eq!((frame.width, frame.height), (800, 600));
+        assert_eq!(frame.rgba, source.rgba);
+    }
+```
+
+These three stay *in addition to* Step 5's `downscale_uses_the_profile_box`: that new test only checks 1080p passthrough and the 720p box, so it does **not** cover the ultrawide aspect or the no-upscale case. Deleting them instead of repointing them would silently drop that coverage. `grep -rn 'MAX_WIDTH\|MAX_HEIGHT' apps/agent/src` must print nothing after this step.
+
 - [ ] **Step 5: Write the failing enumeration + `source_for` + `WindowSource` tests**
 
 ```rust
@@ -812,6 +870,38 @@ Update the two existing `run_stream` call sites in tests (`run_stream_stops_clea
         let ids: Vec<_> = sources.iter().map(|s| s.id.clone()).collect();
         let ids_again: Vec<_> = again.iter().map(|s| s.id.clone()).collect();
         assert_eq!(ids, ids_again);
+    }
+
+    /// `WindowSource` is a `FrameSource` with real teardown, so it needs the same
+    /// headless seam `ScreenSource` has (`from_parts_for_test`, line 390): the
+    /// capture thread is the only platform-specific part, and the channel
+    /// plumbing on either side of it is what this test pins — a queued frame is
+    /// returned once, the queue then drains, and `stop` takes the sender so a
+    /// subsequent call is a clean `None` (never a panic on a dead thread).
+    #[test]
+    fn window_source_forwards_frames_and_stops_cleanly() {
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<()>();
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<xcap::Frame>();
+        // Pre-queue the frame the capture thread would produce, so `next_frame`'s
+        // drain is deterministic: the real thread pushes asynchronously, but the
+        // request/reply plumbing is the part this test pins.
+        frame_tx.send(xcap::Frame::new(4, 4, vec![7u8; 64])).unwrap();
+        // A stub responder standing in for the capture thread: it drains requests
+        // and ends when `stop` drops the request sender.
+        let responder = std::thread::spawn(move || {
+            while request_rx.recv().is_ok() {}
+        });
+        let mut source = WindowSource::from_parts_for_test(request_tx, frame_rx, responder);
+
+        let frame = source.next_frame().unwrap().expect("one queued frame");
+        assert_eq!((frame.width, frame.height), (4, 4));
+        assert_eq!(frame.rgba.len(), 64);
+        assert!(source.next_frame().unwrap().is_none(), "queue drained");
+
+        // `stop` drops the request sender, so the responder's `recv` returns Err
+        // and the thread ends; the join in `stop` must complete rather than hang.
+        source.stop();
+        assert!(source.next_frame().unwrap().is_none(), "stopped source yields nothing");
     }
 ```
 
@@ -1067,6 +1157,23 @@ impl WindowSource {
             thread: Some(thread),
         })
     }
+
+    /// Test seam: wires an already-built request sender, frame channel, and
+    /// responder thread, so `next_frame`/`stop` can be exercised without a
+    /// window. Mirrors `ScreenSource::from_parts_for_test` (line 390) — the
+    /// capture thread is the only platform-specific part of the type.
+    #[cfg(test)]
+    fn from_parts_for_test(
+        request: std::sync::mpsc::Sender<()>,
+        frames: Receiver<xcap::Frame>,
+        thread: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            request: Some(request),
+            frames: Some(frames),
+            thread: Some(thread),
+        }
+    }
 }
 
 impl FrameSource for WindowSource {
@@ -1140,10 +1247,22 @@ In `Cli` (after `desktop_source`):
     desktop_default_source: String,
 ```
 
-In `SessionConfig`, add `desktop_profile: StreamProfile` (resolved once in `run_with_reconnect`, so an invalid value fails at startup — with `#[allow(dead_code)]` on the musl build, mirroring `desktop_source`) and `desktop_default_source: String`. Resolve the profile:
+In `SessionConfig`, add two fields, both `#[allow(dead_code)]`-annotated for the musl build (they are read only by `run_desktop_session`, which is compiled out there — the same reason `desktop_source` carries the attribute today):
 
 ```rust
-    let desktop_profile: desktop::StreamProfile = cli
+    /// Unused on musl, where the desktop module is compiled out; kept so the
+    /// CLI shape is identical on every target.
+    #[allow(dead_code)]
+    desktop_profile: StreamProfile,
+    /// Unused on musl for the same reason as `desktop_profile`.
+    #[allow(dead_code)]
+    desktop_default_source: String,
+```
+
+Resolve the profile in `run_with_reconnect` (so an invalid value fails at startup, before any connection):
+
+```rust
+    let desktop_profile: StreamProfile = cli
         .desktop_profile
         .parse()
         .context("--desktop-profile / AGENT_DESKTOP_PROFILE")?;
@@ -1155,15 +1274,28 @@ and carry the default-source preference straight through:
     desktop_default_source: cli.desktop_default_source,
 ```
 
-> On musl the `desktop` module is compiled out, so the field is `#[allow(dead_code)]` and the parse uses a small `#[cfg]`-gated helper or simply stays as a `String` on musl. Mirror the existing `desktop_source` pattern exactly: one struct shape on every target.
+> **Why this compiles on every target.** `StreamProfile` is defined in `main.rs` (Step 1), *unconditionally* — so `SessionConfig`'s field resolves on musl too, and the `.parse()` call is real code that runs there. Only the *field's reader* (`run_desktop_session`) is musl-gated, which is why the field needs `#[allow(dead_code)]`. Do **not** try to define `StreamProfile` in `desktop.rs`: a field whose type is named only inside the musl-gated module is an E0433 name-resolution error on musl, and `#[allow(dead_code)]` cannot repair a type that is not in scope.
+>
+> **Warnings you may see on musl only — they are not failures.** `StreamProfile`'s members are read almost entirely from `desktop.rs` (the downscale box, the ticker, `frame_budget`, the encoder config). On musl the `desktop` module is compiled out, so the musl build may report `frame_budget` (and possibly some fields) as never used. That is a *warning*, not an error: the musl leg runs `cargo build --release --locked --target …` with no `-D warnings` (see `build-agent.yml`), while `cargo clippy --all-targets --locked -- -D warnings` runs on the host target where every member *is* used. Leave the members as plain `pub` items — do not add cfg gates or `#[allow]`s, which would be dead weight on the target that matters.
 
-In `run_desktop_session`, create the default source from the resolved id and pass the profile. The id comes from `default_source_id`, so `AGENT_DESKTOP_DEFAULT_SOURCE` decides which source streams before any selection (ADR-22) — an explicit id is validated there, and a capture failure still refuses the offer *before* the answer (the Week 7 invariant):
+In `run_desktop_session`, resolve the default source id, then build the source — **both** failures go through the same clean-refusal path. `default_source_id` can fail on a bad `AGENT_DESKTOP_DEFAULT_SOURCE` or an unreadable primary monitor, and that is a pre-answer refusal exactly like a capture failure: routing it through `?` would propagate out of `run_one_session` and skip the `approved: false` answer, leaving the browser on a hang instead of a refusal. So match it, and fall through to the same `refuse_offer` arm as `source_for`:
 
 ```rust
-    let default_id = desktop::default_source_id(
+    // A bad default-source preference (or an unreadable primary monitor) is a
+    // refusal, not a propagated error: the client must see `approved: false`,
+    // the same as a capture failure, not a dropped signaling connection.
+    let default_id = match desktop::default_source_id(
         cfg.desktop_source == DesktopSource::Test,
         &cfg.desktop_default_source,
-    )?;
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = ?e, "desktop default source unavailable; refusing the offer");
+            rtc::refuse_offer(peer, offer, outbound).await?;
+            let _ = peer.close().await;
+            return Ok(());
+        }
+    };
     let source: Box<dyn desktop::FrameSource> = match desktop::source_for(&default_id, cfg.desktop_profile).await {
         Ok(source) => source,
         Err(e) => {
@@ -1220,7 +1352,7 @@ cargo test --manifest-path apps/agent/Cargo.toml --locked
 cargo fmt --manifest-path apps/agent/Cargo.toml --check
 cargo clippy --manifest-path apps/agent/Cargo.toml --all-targets --locked -- -D warnings
 ```
-Expected: PASS. `enumerate_sources_lists_at_least_one_monitor`, `source_for_rejects_an_id_absent_from_the_enumeration`, and the Week 7 `screen_source_smoke_on_a_live_display` are `#[ignore]`d and do not run in CI. The clippy line is the one that would have caught the dead `ScreenSource::new`/`primary_recorder` — it must be clean.
+Expected: PASS. `enumerate_sources_lists_at_least_one_monitor`, `source_for_rejects_an_id_absent_from_the_enumeration`, and the Week 7 `screen_source_smoke_on_a_live_display` are `#[ignore]`d and do not run in CI. The new `window_source_forwards_frames_and_stops_cleanly` runs in CI (it uses the `from_parts_for_test` seam, no window needed) — it must be green, and it is what proves `WindowSource::stop` joins its thread rather than hanging. The clippy line is the one that would have caught the dead `ScreenSource::new`/`primary_recorder` — it must be clean.
 
 - [ ] **Step 9: Add and run the `ScreenContentRealTime` watch-item test**
 
@@ -1303,7 +1435,7 @@ git commit -m "feat(agent): resolve StreamProfile, enumerate capture sources, ad
 
 - [ ] **Step 1: Add `StreamControl` and the decoder to `desktop.rs`**
 
-Below the `StreamProfile` impl in `apps/agent/src/desktop.rs`:
+Below the `DesktopEncoder` impl in `apps/agent/src/desktop.rs` (`StreamProfile` itself lives in `main.rs` — see Task 3, Step 1):
 
 ```rust
 /// The bitrate range a `desktop-bitrate` frame is clamped into (spec §9).
